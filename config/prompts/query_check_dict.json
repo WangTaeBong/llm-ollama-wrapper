@@ -1,0 +1,198 @@
+{
+	"ko": {
+		"greetings": [
+			"안녕하세요",
+			"안녕",
+			"하이",
+			"하이루",
+			"반가워",
+			"반가워요",
+			"넌 누구니",
+			"이름이 뭐야",
+			"이름",
+			"이름 알려줘",
+			"이름을 알려줘",
+			"이름 알려주세요",
+			"이름을 알려주세요",
+			"방가",
+			"방가방가",
+			"ㅎㅇ"
+		],
+		"greetings_msg": [
+			"안녕하세요. MAI Chat입니다. 무엇을 도와드릴까요?",
+			"안녕하세요. 자세하고 친절하게 답변해 드릴게요. 질문을 입력해 주세요.",
+			"안녕하세요. MAI Chat과 스마트한 세상을 경험해 보세요.",
+			"반가워요! 궁금한 점이 있으시면 언제든지 편안하게 질문해 주세요."
+		],
+		"endings": [
+			"고마워",
+			"알려줘서 고마워",
+			"땡큐",
+			"바이",
+			"굿바이"
+		],
+		"endings_msg": [
+			"감사합니다. 항상 건강과 행복이 가득하길 바랄게요. 좋은 하루 보내세요!",
+			"도움이 되셨길 바랍니다. 필요한 정보가 있으면 언제든지 MAI Chat을 이용해 주세요.",
+			"즐거운 대화였어요. 다른 궁금한 점이나 도움이 필요하시면 언제든지 MAI Chat을 이용해 주세요."
+		],
+		"farewells": [
+			"바보",
+			"멍청이",
+			"멍청하네",
+			"아는게 뭐야",
+			"아는게 머야",
+			"할 줄 아는게 뭐야",
+			"할 줄 아는거 없네",
+			"쓰레기",
+			"알려줘",
+			"뭐야"
+		],
+		"farewells_msg": [
+			"질문을 이해하지 못했습니다. 도움을 드릴 수 있도록 좀 더 구체적으로 설명해 줄 수 있으실까요?",
+			"잘 알겠습니다. 더 궁금한 사항이 있으면 언제든지 MAI Chat을 이용해 주세요. 도움이 될 수 있도록 최선을 다하겠습니다.",
+			"적절한 답변을 드리기 어렵습니다. 다른 질문이 있다면 언제든지 도와 드리겠습니다.",
+			"입력을 기다리고 있어요~"
+		]
+	},
+	"en": {
+		"greetings": [
+			"hello",
+			"hi",
+			"how are you",
+			"what's up",
+			"how do you do",
+			"oh",
+			"who are you",
+			"what is your name",
+			"name",
+			"tell me your name",
+			"please tell me your name"
+		],
+		"greetings_msg": [
+			"Hi. This is MAI Chat. How can we help you?",
+			"Hi. Please enter your question and we'll get back to you with a detailed and friendly answer.",
+			"Hi. Experience a smarter world with MAI Chat.",
+			"Hello! If you have any questions, feel free to ask.",
+			"It's great to see you! If you have any questions, please feel free to ask."
+		],
+		"endings": [
+			"goodbye",
+			"good",
+			"good bye",
+			"thank you",
+			"thanks",
+			"bye",
+			"see you",
+			"appreciate it",
+			"bye bye"
+		],
+		"endings_msg": [
+			"Thank you very much. Wishing you always good health and happiness. Have a great day!",
+			"We hope this helps. Feel free to use MAI Chat if you need more information.",
+			"It's been a pleasure talking to you, and if you have any other questions or need help, feel free to use MAI Chat."
+		],
+		"farewells": [
+			"oops",
+			"oh my god",
+			"opps",
+			"stupid",
+			"what are you doing",
+			"can you do anything",
+			"you are useless",
+			"trash",
+			"tell me",
+			"what"
+		],
+		"farewells_msg": [
+			"I don't understand your question. Can you be a little more specific so we can help?",
+			"Great, if you have any more questions, feel free to use MAI Chat. We'll do our best to help.",
+			"I'm sorry, but I'm unable to help you with this question. If you have any other questions, feel free to ask.",
+			"We don't have a good answer for you. If you have any other questions, we're happy to help.",
+			"Waiting for input~."
+		]
+	},
+	"jp": {
+		"greetings": [
+			"こんにちは",
+			"やあ",
+			"ハロー",
+			"元気ですか",
+			"おはよう",
+			"名前は何ですか",
+			"名前を教えて",
+			"名前を教えてください"
+		],
+		"greetings_msg": [
+			"こんにちは、MAI Chatです。何をお手伝いしましょうか？",
+			"こんにちは。ご質問を入力してください。丁寧にお答えします。",
+			"こんにちは。MAI Chatでスマートな世界を体験してください。",
+			"お会いできてうれしいです！何か質問があれば、気軽にお尋ねください。"
+		],
+		"endings": [
+			"ありがとう",
+			"感謝します",
+			"さようなら",
+			"バイバイ",
+			"またね"
+		],
+		"endings_msg": [
+			"ありがとうございました。いつも健康で幸せでありますように。良い一日を！",
+			"お役に立てれば幸いです。何かあれば、いつでもMAI Chatをご利用ください。",
+			"楽しいお話でした。また何か質問があれば、気軽にMAI Chatをご利用ください。"
+		],
+		"farewells": [
+			"何これ",
+			"できない",
+			"おかしい",
+			"意味わからない"
+		],
+		"farewells_msg": [
+			"質問を理解できませんでした。もう少し具体的に説明していただけますか？",
+			"わかりました。何か他に気になることがあれば、いつでもMAI Chatをご利用ください。",
+			"適切な回答が難しいです。他の質問があれば、いつでもお手伝いします。",
+			"入力をお待ちしています。"
+		]
+	},
+	"cn": {
+		"greetings": [
+			"你好",
+			"嗨",
+			"哈喽",
+			"你好吗",
+			"叫什么名字",
+			"可以告诉我你的名字吗",
+			"名字是什么"
+		],
+		"greetings_msg": [
+			"你好，我是MAI Chat。请问有什么可以帮助您的？",
+			"你好，请输入您的问题，我会详细回答。",
+			"你好！通过MAI Chat体验智能世界吧。",
+			"很高兴见到你！有任何问题都可以随时提问哦。"
+		],
+		"endings": [
+			"谢谢",
+			"感谢",
+			"再见",
+			"拜拜",
+			"下次见"
+		],
+		"endings_msg": [
+			"非常感谢。祝您健康幸福！祝您有美好的一天！",
+			"希望对您有所帮助。如有其他问题，请随时使用MAI Chat。",
+			"和您聊天很愉快。如有其他疑问或需要帮助，随时联系我们。"
+		],
+		"farewells": [
+			"哦",
+			"什么意思",
+			"搞不懂",
+			"你会做什么"
+		],
+		"farewells_msg": [
+			"我无法理解您的问题。可以更具体一些吗？",
+			"好的，如果您还有其他问题，请随时使用MAI Chat。",
+			"很抱歉，我无法帮助解决这个问题。如有其他问题，请告诉我。",
+			"暂时没有答案。如有其他问题，我们很乐意为您解答。"
+		]
+	}
+}
