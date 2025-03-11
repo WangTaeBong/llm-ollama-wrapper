@@ -1,13 +1,18 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from starlette.responses import StreamingResponse
 
 from src.schema.chat_req import ChatRequest
 from src.schema.chat_res import ChatResponse
 from src.services.llm_ollama_process import ChatService
+from src.common.config_loader import ConfigLoader
 
 # Configure logger
 logger = logging.getLogger(__name__)
+
+# Load application settings from configuration
+settings = ConfigLoader().get_settings()
 
 # Router configuration
 llm_router = APIRouter(prefix='/v1', tags=["LLM Chat"])
@@ -100,6 +105,8 @@ async def chat(
         HTTPException(500): For unexpected server errors
     """
     try:
+        logger.info(f"[{request.meta.session_id}] 채팅 요청 수신")
+
         # Process the chat request
         response = await chat_service.process_chat()
 
@@ -133,4 +140,72 @@ async def chat(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal server error occurred. Reference ID: {error_id}",
+        )
+
+
+@llm_router.post(path="/chat/stream", response_class=StreamingResponse)
+async def chat_stream(request: ChatRequest, background_tasks: BackgroundTasks):
+    """
+    스트리밍 채팅 API 엔드포인트
+
+    클라이언트에 점진적으로 응답을 스트리밍하는 채팅 API입니다.
+    SSE(Server-Sent Events) 형식으로 응답을 전송합니다.
+
+    Args:
+        request: 채팅 요청 데이터
+        background_tasks: 백그라운드 작업 실행기
+
+    Returns:
+        StreamingResponse: 스트리밍 응답 객체
+    """
+    logger.info(f"[{request.meta.session_id}] 스트리밍 채팅 요청 수신")
+
+    # 설정에서 스트리밍 활성화 여부 확인
+    if not settings.llm.steaming_enabled:
+        logger.warning(f"[{request.meta.session_id}] 스트리밍이 설정에서 비활성화되어 있습니다.")
+
+        # 오류 응답 스트림
+        async def error_stream():
+            error_msg = {"error": True, "text": "스트리밍이 서버 설정에서 비활성화되어 있습니다.", "finished": True}
+            yield f"data: {json.dumps(error_msg)}\n\n"
+
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
+
+    # vLLM 백엔드 확인
+    if settings.llm.llm_backend.lower() != "vllm":
+        logger.warning(f"[{request.meta.session_id}] 스트리밍은 vLLM 백엔드에서만 지원됩니다.")
+
+        # 오류 응답 스트림
+        async def error_stream():
+            error_msg = {"error": True, "text": "스트리밍은 vLLM 백엔드에서만 지원됩니다.", "finished": True}
+            yield f"data: {json.dumps(error_msg)}\n\n"
+
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
+
+    # 채팅 서비스 초기화
+    chat_service = ChatService(request)
+
+    try:
+        # 스트리밍 응답 처리
+        response = await chat_service.stream_chat(background_tasks)
+
+        # 중요: Content-Type 헤더에 charset=utf-8 추가
+        response.headers["Content-Type"] = "text/event-stream; charset=utf-8"
+
+        return response
+    except Exception as e:
+        logger.error(f"[{request.meta.session_id}] 스트리밍 처리 중 오류: {str(e)}", exc_info=True)
+
+        # 오류 응답 스트림
+        async def error_stream():
+            # 중요: JSON 직렬화 시 ensure_ascii=False 설정
+            error_msg = json.dumps(
+                {"error": True, "text": f"처리 중 오류가 발생했습니다: {str(e)}", "finished": True},
+                ensure_ascii=False
+            )
+            yield f"data: {error_msg}\n\n"
+
+        return StreamingResponse(
+            error_stream(),
+            media_type="text/event-stream; charset=utf-8"  # charset 명시
         )

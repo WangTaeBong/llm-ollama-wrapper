@@ -24,6 +24,7 @@ Dependencies:
 """
 
 import asyncio
+import json
 import inspect
 import logging
 import random
@@ -33,12 +34,14 @@ from asyncio import Semaphore, create_task, wait_for, TimeoutError
 from contextlib import asynccontextmanager
 from functools import lru_cache, wraps
 from threading import Lock
+from typing import Tuple, Optional, List
 
 from cachetools import TTLCache
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama.llms import OllamaLLM
+from starlette.responses import StreamingResponse
 
 from src.common.config_loader import ConfigLoader
 from src.common.error_cd import ErrorCd
@@ -616,7 +619,7 @@ class LLMService:
             data (VllmInquery): vLLM request data.
 
         Returns:
-            dict: Response from vLLM endpoint.
+            Dict, AsyncGenerator: 스트리밍 모드에 따라 전체 응답 또는 청크 생성기 반환
 
         Raises:
             Exception: If vLLM endpoint call fails after retries.
@@ -625,84 +628,283 @@ class LLMService:
         session_id = self.request.meta.session_id
         logger.debug(f"[{session_id}] Calling vLLM endpoint (stream={data.stream})")
 
+        # circuit_breaker 확인
+        if _vllm_circuit_breaker.is_open():
+            logger.warning(f"[{session_id}] circuit_breaker 열려 있어 요청을 건너뜁니다.")
+            raise RuntimeError("vLLM 서비스 사용할 수 없음: circuit_breaker가 열려 있습니다")
+
         vllm_url = settings.vllm.endpoint_url
 
         try:
-            if data.stream:
-                full_text = ""
-                async for chunk in rc.restapi_stream_async(session_id, vllm_url, data):
-                    # 실제 청크 내용 확인
-                    logger.debug(f"Received chunk: {chunk}")
+            response = await rc.restapi_post_async(vllm_url, data)
+            elapsed = time.time() - start_time
+            logger.debug(f"[{session_id}] vLLM response received: {elapsed:.4f}s elapsed")
 
-                    # 각 청크에서 텍스트 추출 및 누적
-                    if 'new_text' in chunk:
-                        text_chunk = chunk.get('new_text', '')
-                        full_text += text_chunk
+            # 메트릭 업데이트
+            self.metrics["request_count"] += 1
+            self.metrics["total_time"] += elapsed
 
-                        # 로깅 (옵션)
-                        logger.debug(f"[{session_id}] Streaming chunk: {text_chunk}")
+            # circuit_breaker 업데이트
+            _vllm_circuit_breaker.record_success()
 
-                    # 생성 완료 확인
-                    if chunk.get('finished', False):
-                        break
-
-                # 스트리밍 완료 후 전체 텍스트 반환
-                elapsed = time.time() - start_time
-                logger.debug(f"[{session_id}] vLLM streaming response received: {elapsed:.4f}s elapsed")
-
-                self.metrics["request_count"] += 1
-                self.metrics["total_time"] += elapsed
-
-                return {"generated_text": full_text}
-            else:
-                response = await rc.restapi_post_async(vllm_url, data)
-                elapsed = time.time() - start_time
-                logger.debug(f"[{session_id}] vLLM response received: {elapsed:.4f}s elapsed")
-
-                self.metrics["request_count"] += 1
-                self.metrics["total_time"] += elapsed
-
-                return response
+            return response
         except Exception as e:
             elapsed = time.time() - start_time
             logger.error(f"[{session_id}] vLLM endpoint error: {elapsed:.4f}s after: {str(e)}")
 
             self.metrics["error_count"] += 1
 
+            # circuit_breaker 업데이트
+            _vllm_circuit_breaker.record_failure()
+
             raise
 
-    async def _stream_vllm_generate(self, session_id: str, url: str, data: VllmInquery):
+    async def _stream_vllm_response(self, session_id: str, url: str, data: VllmInquery):
         """
-        스트리밍 생성을 위한 내부 제너레이터 메서드
+        vLLM에서 스트리밍 응답을 받아 처리하는 비동기 제너레이터입니다.
 
         Args:
-            url: 엔드포인트 URL
-            data: VllmInquery 객체
+            session_id: 세션 ID
+            url: vLLM 엔드포인트 URL
+            data: vLLM 요청 데이터
 
         Yields:
-            스트리밍 청크
+            Dict: 응답 청크
         """
+        from src.common.restclient import rc
+        start_time = time.time()
+
         try:
-            session_id = self.request.meta.session_id
-            async for chunk in await rc.restapi_stream_async(url, data):
-                if chunk is not None:
+            logger.debug(f"[{session_id}] vLLM 스트리밍 시작")
+
+            # RestClient의 스트리밍 메서드를 호출하여 청크 처리
+            async for chunk in rc.restapi_stream_async(session_id, url, data):
+                if chunk is None:
+                    continue
+
+                # 청크 처리 및 표준화
+                processed_chunk = self._process_vllm_chunk(chunk)
+
+                # 청크 로깅 (텍스트가 있는 경우 길이만 기록)
+                log_chunk = processed_chunk.copy()
+                if 'new_text' in log_chunk:
+                    log_chunk['new_text'] = f"<{len(log_chunk['new_text'])}자 길이의 텍스트>"
+                logger.debug(f"[{session_id}] 청크 처리: {log_chunk}")
+
+                yield processed_chunk
+
+                # 마지막 청크 처리
+                if processed_chunk.get('finished', False) or processed_chunk.get('error', False):
+                    # 회로 차단기 성공 기록
+                    _vllm_circuit_breaker.record_success()
+
+                    # 메트릭 업데이트
+                    elapsed = time.time() - start_time
+                    self.metrics["request_count"] += 1
+                    self.metrics["total_time"] += elapsed
+
+                    logger.debug(f"[{session_id}] vLLM 스트리밍 완료: {elapsed:.4f}초 소요")
+                    break
+
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(f"[{session_id}] vLLM 스트리밍 오류: {elapsed:.4f}초 후: {str(e)}")
+
+            # 메트릭 업데이트
+            self.metrics["error_count"] += 1
+
+            # 회로 차단기 실패 기록
+            _vllm_circuit_breaker.record_failure()
+
+            # 오류 청크 반환
+            yield {
+                "error": True,
+                "message": f"스트리밍 오류: {str(e)}",
+                "finished": True
+            }
+
+    @classmethod
+    def _process_vllm_chunk(cls, chunk):
+        """
+        vLLM 응답 청크를 표준 형식으로 처리합니다.
+
+        Args:
+            chunk: 원시 vLLM 응답 청크
+
+        Returns:
+            Dict: 처리된 청크
+        """
+        # 오류 확인
+        if 'error' in chunk:
+            return {
+                'error': True,
+                'message': chunk.get('message', '알 수 없는 오류'),
+                'finished': True
+            }
+
+        # 종료 마커 확인
+        if chunk == '[DONE]':
+            return {
+                'new_text': '',
+                'finished': True
+            }
+
+        # vLLM의 다양한 응답 형식 처리
+        if isinstance(chunk, dict):
+            # 텍스트 청크 (일반 스트리밍)
+            if 'new_text' in chunk:
+                return {
+                    'new_text': chunk['new_text'],
+                    'finished': chunk.get('finished', False)
+                }
+            # 완료 신호
+            elif 'finished' in chunk and chunk['finished']:
+                return {
+                    'new_text': '',
+                    'finished': True
+                }
+            # 전체 텍스트 응답 (비스트리밍 형식)
+            elif 'generated_text' in chunk:
+                return {
+                    'new_text': chunk['generated_text'],
+                    'finished': True
+                }
+            # OpenAI 호환 형식
+            elif 'delta' in chunk:
+                return {
+                    'new_text': chunk['delta'].get('content', ''),
+                    'finished': chunk.get('finished', False)
+                }
+            # 알 수 없는 형식
+            else:
+                return chunk
+
+        # 문자열 응답 (드문 경우)
+        elif isinstance(chunk, str):
+            return {
+                'new_text': chunk,
+                'finished': False
+            }
+
+        # 기타 타입 처리
+        return {
+            'new_text': str(chunk),
+            'finished': False
+        }
+
+    async def stream_response(self, documents, language):
+        """
+        스트리밍 응답을 제공하는 메서드.
+
+        Args:
+            documents (list): 컨텍스트용 문서 목록
+            language (str): 응답 언어
+
+        Returns:
+            AsyncGenerator: 응답 청크를 생성하는 비동기 제너레이터
+        """
+        session_id = self.request.meta.session_id
+        logger.debug(f"[{session_id}] 스트리밍 응답 시작")
+
+        # 컨텍스트 준비
+        context = {
+            "input": self.request.chat.user,
+            "context": documents,
+            "language": language,
+            "today": self.response_generator.get_today(),
+        }
+
+        # VOC 관련 컨텍스트 추가 (필요한 경우)
+        if self.request.meta.rag_sys_info == "komico_voc":
+            context.update({
+                "gw_doc_id_prefix_url": settings.voc.gw_doc_id_prefix_url,
+                "check_gw_word_link": settings.voc.check_gw_word_link,
+                "check_gw_word": settings.voc.check_gw_word,
+                "check_block_line": settings.voc.check_block_line,
+            })
+
+        try:
+            # vLLM 엔진만 현재 스트리밍 지원
+            if settings.llm.llm_backend.lower() == "vllm":
+                # 시스템 프롬프트 생성
+                vllm_inquery_context = self.build_system_prompt(context)
+
+                # 스트리밍을 위한 vLLM 요청 준비
+                vllm_request = VllmInquery(
+                    request_id=session_id,
+                    prompt=vllm_inquery_context,
+                    stream=True  # 스트리밍 모드 활성화
+                )
+
+                # vLLM 스트리밍 엔드포인트 호출
+                vllm_url = settings.vllm.endpoint_url
+
+                # 스트리밍 응답 제공
+                async for chunk in self._stream_vllm_generate(session_id, vllm_url, vllm_request):
                     yield chunk
 
-                    # [DONE] 청크로 스트리밍 종료 확인
-                    if chunk == '[DONE]':
-                        break
-        except Exception as e:
-            logger.error(f"[{session_id}] vLLM streaming error: {str(e)}")
-            raise
+            else:
+                # 다른 백엔드는 스트리밍을 지원하지 않음 - 에러 응답
+                logger.error(f"[{session_id}] 스트리밍은 vLLM 백엔드에서만 지원됩니다.")
+                yield {
+                    "error": True,
+                    "message": "스트리밍은 vLLM 백엔드에서만 지원됩니다."
+                }
 
-    async def ask(self, documents, language, streaming: bool = False):
+        except Exception as e:
+            logger.error(f"[{session_id}] 스트리밍 응답 중 오류 발생: {str(e)}", exc_info=True)
+            yield {"error": True, "message": str(e)}
+
+    @classmethod
+    async def _stream_vllm_generate(cls, session_id: str, url: str, data: VllmInquery):
+        """
+        개선된 vLLM 스트리밍 제너레이터
+
+        Args:
+            session_id: 세션 ID
+            url: vLLM 엔드포인트 URL
+            data: vLLM 요청 데이터
+
+        Yields:
+            dict: 스트리밍 청크
+        """
+        from src.common.restclient import rc
+
+        try:
+            # StreamingResponse 구현을 위한 제너레이터
+            async for chunk in rc.restapi_stream_async(session_id, url, data):
+                if chunk is None:
+                    continue
+
+                # 올바른 형식으로 청크 반환
+                if isinstance(chunk, dict):
+                    # 새로운 텍스트가 있는 경우
+                    if 'new_text' in chunk:
+                        yield {
+                            "text": chunk['new_text'],
+                            "finished": chunk.get('finished', False)
+                        }
+                    # 완료 신호만 있는 경우
+                    elif chunk.get('finished', False):
+                        yield {"text": "", "finished": True}
+                elif chunk == '[DONE]':
+                    # 종료 마커
+                    yield {"text": "", "finished": True}
+                else:
+                    # 기타 형식의 청크
+                    yield {"text": str(chunk), "finished": False}
+
+        except Exception as e:
+            logger.error(f"[{session_id}] vLLM 스트리밍 오류: {str(e)}")
+            yield {"error": True, "message": str(e)}
+
+    async def ask(self, documents, language):
         """
         Perform a query to the LLM.
 
         Args:
             documents (list): List of documents for context.
             language (str): Response language.
-            streaming (bool): Whether to stream the response.
 
         Returns:
             str: Generated response.
@@ -1126,6 +1328,261 @@ class ChatService:
                             session_id=session_id, exc_info=True)
             return self._create_response(ErrorCd.get_error(ErrorCd.CHAT_EXCEPTION), "Unable to process the request.")
 
+    async def stream_chat(self, background_tasks: BackgroundTasks = None) -> StreamingResponse:
+        """
+        스트리밍 방식으로 채팅 요청을 처리하는 메서드
+
+        점진적으로 생성되는 LLM 응답을 클라이언트에게 제공하여
+        더 빠른 응답 시작 시간과 사용자 경험을 제공.
+
+        Args:
+            background_tasks: 백그라운드 작업 실행을 위한 FastAPI BackgroundTasks 객체
+
+        Returns:
+            StreamingResponse: 스트리밍 응답 객체
+        """
+        session_id = self.request.meta.session_id
+        await self._log("info", f"[{session_id}] 스트리밍 채팅 요청 처리 시작", session_id=session_id)
+
+        # 타이머 초기화
+        self.start_time = time.time()
+        self.processing_stages = {}
+
+        try:
+            # 인사말 또는 필터링 체크
+            greeting_response = await self._handle_greeting_or_filter()
+            if greeting_response:
+                elapsed = self._record_stage("greeting_filter")
+                await self._log("info", f"[{session_id}] 인사말/필터 단계 완료: {elapsed:.4f}초 소요",
+                                session_id=session_id)
+
+                # 단순 응답은 스트리밍이 필요없어 일반 텍스트로 반환
+                async def simple_stream():
+                    yield f"data: {json.dumps({'text': greeting_response.chat.system, 'finished': True})}\n\n"
+
+                return StreamingResponse(simple_stream(), media_type="text/event-stream")
+
+            # 문서 검색 및 언어 설정 병렬 처리
+            retrieval_task = asyncio.create_task(self._retrieve_documents())
+            language_task = asyncio.create_task(self._get_language_settings())
+
+            # 병렬 작업 완료 대기
+            await asyncio.gather(retrieval_task, language_task)
+
+            # 결과 수집
+            documents = retrieval_task.result()
+            lang, trans_lang, reference_word = language_task.result()
+
+            elapsed = self._record_stage("parallel_processing")
+            await self._log(
+                "info",
+                f"[{session_id}] 병렬 처리 완료(준비): {elapsed:.4f}초 소요, "
+                f"{len(documents)} 문서 검색됨",
+                session_id=session_id
+            )
+
+            # vLLM 백엔드 확인
+            if settings.llm.llm_backend.lower() != "vllm":
+                await self._log("error", f"[{session_id}] 스트리밍은 vLLM 백엔드에서만 지원됩니다.")
+
+                # 오류 응답 스트림
+                async def error_stream():
+                    error_msg = "스트리밍은 vLLM 백엔드에서만 지원됩니다."
+                    yield f"data: {json.dumps({'error': True, 'text': error_msg, 'finished': True})}\n\n"
+
+                return StreamingResponse(error_stream(), media_type="text/event-stream")
+
+            # 후처리기 초기화
+            post_processor = StreamResponsePostProcessor(
+                self.response_generator,
+                self.voc_processor,
+                self.search_engine,
+                self.request,
+                documents
+            )
+
+            # 스트리밍 컨텍스트 준비
+            context = {
+                "input": self.request.chat.user,
+                "context": documents,
+                "language": lang,
+                "today": self.response_generator.get_today(),
+            }
+
+            # VOC 관련 컨텍스트 추가
+            if self.request.meta.rag_sys_info == "komico_voc":
+                context.update({
+                    "gw_doc_id_prefix_url": settings.voc.gw_doc_id_prefix_url,
+                    "check_gw_word_link": settings.voc.check_gw_word_link,
+                    "check_gw_word": settings.voc.check_gw_word,
+                    "check_block_line": settings.voc.check_block_line,
+                })
+
+            # 시스템 프롬프트 생성
+            vllm_inquery_context = self.llm_service.build_system_prompt(context)
+
+            # vLLM 요청 객체 생성
+            vllm_request = VllmInquery(
+                request_id=session_id,
+                prompt=vllm_inquery_context,
+                stream=True  # 스트리밍 모드 활성화
+            )
+
+            # 스트리밍 응답 생성 함수
+            async def generate_stream():
+                start_llm_time = time.time()
+                buffer = ""  # 텍스트 버퍼
+                error_occurred = False
+
+                try:
+                    # vLLM 엔드포인트 호출
+                    from src.common.restclient import rc
+                    vllm_url = settings.vllm.endpoint_url
+
+                    # 스트리밍 응답 처리
+                    async for chunk in rc.restapi_stream_async(session_id, vllm_url, vllm_request):
+                        if chunk is None:
+                            continue
+
+                        if isinstance(chunk, dict):
+                            # 새 텍스트가 있는 경우
+                            if 'new_text' in chunk:
+                                text_chunk = chunk.get('new_text', '')
+                                is_finished = chunk.get('finished', False)
+
+                                # 버퍼에 텍스트 추가
+                                buffer += text_chunk
+
+                                # 부분 처리 수행
+                                processed_text, buffer = post_processor.process_partial(buffer)
+
+                                if processed_text:
+                                    # 처리된 텍스트가 있으면 전송
+                                    # 중요: JSON 직렬화 시 ensure_ascii=False 설정으로 한글이 이스케이프되지 않도록 함
+                                    json_data = json.dumps(
+                                        {'text': processed_text, 'finished': False},
+                                        ensure_ascii=False
+                                    )
+                                    yield f"data: {json_data}\n\n"
+
+                                # 마지막 청크인 경우
+                                if is_finished:
+                                    final_text = await post_processor.finalize(buffer)
+                                    if final_text:
+                                        # 중요: JSON 직렬화 시 ensure_ascii=False 설정
+                                        json_data = json.dumps(
+                                            {'text': final_text, 'finished': True},
+                                            ensure_ascii=False
+                                        )
+                                        yield f"data: {json_data}\n\n"
+                                    else:
+                                        yield f"data: {json.dumps({'text': '', 'finished': True}, ensure_ascii=False)}\n\n"
+                                    break
+
+                            # 완료 신호만 있는 경우
+                            elif chunk.get('finished', False):
+                                final_text = await post_processor.finalize(buffer)
+                                if final_text:
+                                    # 중요: JSON 직렬화 시 ensure_ascii=False 설정
+                                    json_data = json.dumps(
+                                        {'text': final_text, 'finished': True},
+                                        ensure_ascii=False
+                                    )
+                                else:
+                                    yield f"data: {json.dumps({'text': '', 'finished': True}, ensure_ascii=False)}\n\n"
+                                break
+
+                        # 종료 마커
+                        elif chunk == '[DONE]':
+                            final_text = await post_processor.finalize(buffer)
+                            if final_text:
+                                # 중요: JSON 직렬화 시 ensure_ascii=False 설정
+                                json_data = json.dumps(
+                                    {'text': final_text, 'finished': True},
+                                    ensure_ascii=False
+                                )
+                                yield f"data: {json_data}\n\n"
+                            else:
+                                yield f"data: {json.dumps({'text': '', 'finished': True}, ensure_ascii=False)}\n\n"
+                            break
+
+                    # LLM 처리 시간 기록
+                    llm_elapsed = time.time() - start_llm_time
+                    await self._log(
+                        "info",
+                        f"[{session_id}] LLM 처리 완료: {llm_elapsed:.4f}초 소요 "
+                        f"[backend={settings.llm.llm_backend}]",
+                        session_id=session_id
+                    )
+                    self._record_stage("llm_processing")
+
+                    # 채팅 이력 저장
+                    if settings.chat_history.enabled:
+                        full_text = post_processor.get_full_text()
+                        if full_text:
+                            if background_tasks:
+                                # BackgroundTasks가 제공된 경우
+                                background_tasks.add_task(self._save_chat_history, full_text)
+                            else:
+                                # 없으면 직접 Task 생성
+                                self._fire_and_forget(self._save_chat_history(full_text))
+
+                except Exception as err:
+                    error_occurred = True
+                    await self._log("error", f"[{session_id}] 스트리밍 처리 중 오류: {str(err)}", exc_info=True)
+                    # 중요: JSON 직렬화 시 ensure_ascii=False 설정
+                    error_json = json.dumps(
+                        {'error': True, 'text': str(e), 'finished': True},
+                        ensure_ascii=False
+                    )
+                    yield f"data: {error_json}\n\n"
+
+                finally:
+                    # 전체 처리 시간 계산
+                    if not error_occurred:
+                        total_time = sum(self.processing_stages.values())
+                        await self._log(
+                            "info",
+                            f"[{session_id}] 채팅 처리 완료: {total_time:.4f}초 소요",
+                            session_id=session_id,
+                            stages=self.processing_stages
+                        )
+
+            # 스트리밍 응답 반환
+            return StreamingResponse(
+                generate_stream(),
+                media_type="text/event-stream"
+            )
+
+        except Exception as e:
+            await self._log("error", f"[{session_id}] 스트리밍 초기화 중 오류: {str(e)}",
+                            session_id=session_id, exc_info=True)
+
+            # 오류 응답 스트림
+            async def error_stream():
+                yield f"data: {json.dumps({'error': True, 'text': f'처리 중 오류가 발생했습니다: {str(e)}', 'finished': True})}\n\n"
+
+            return StreamingResponse(
+                error_stream(),
+                media_type="text/event-stream"
+            )
+
+    def _fire_and_forget(self, coro):
+        """코루틴을 안전하게 실행하고 에러를 로깅합니다."""
+
+        async def wrapper():
+            try:
+                await coro
+            except Exception as e:
+                logger.error(f"백그라운드 태스크 오류: {e}", exc_info=True)
+
+        task = asyncio.create_task(wrapper())
+        if not hasattr(self.__class__, '_background_tasks'):
+            self.__class__._background_tasks = []
+        self.__class__._background_tasks.append(task)
+        task.add_done_callback(
+            lambda t: self.__class__._background_tasks.remove(t) if t in self.__class__._background_tasks else None)
+
     async def _retrieve_documents(self):
         """
         Retrieve documents asynchronously.
@@ -1500,3 +1957,228 @@ class ChatService:
         cls._prompt_cache.clear()
         cls._response_cache.clear()
         logger.info("All ChatService caches have been cleared")
+
+
+class StreamResponsePostProcessor:
+    """
+    스트리밍 응답의 점진적 후처리를 담당하는 클래스
+
+    LLM에서 제공되는 텍스트 청크를 실시간으로 처리하고
+    완성된 문장이나 단락 단위로 부분 처리하며,
+    최종적으로 전체 텍스트에 대한 완전한 후처리를 수행합니다.
+    """
+
+    def __init__(self, response_generator, voc_processor, search_engine, request, documents):
+        """
+        후처리기 초기화
+
+        Args:
+            response_generator: 응답 생성 및 참조 처리 담당 객체
+            voc_processor: VOC 처리 담당 객체
+            search_engine: URL 변환 및 검색 기능 담당 객체
+            request: 원본 채팅 요청
+            documents: 검색된 문서 목록
+        """
+        self.response_generator = response_generator
+        self.voc_processor = voc_processor
+        self.search_engine = search_engine
+        self.request = request
+        self.documents = documents
+        self.logger = logging.getLogger(__name__)
+
+        # 전체 응답 텍스트 저장용 변수
+        self.full_text = ""
+
+        # 처리된 청크들 저장
+        self.processed_chunks = []
+
+        # 말줄임표 패턴 (응답 중 LLM이 생성하는 임시 패턴) 제거용
+        self.ellipsis_pattern = re.compile(r'\.\.\.$')
+
+    def process_partial(self, text: str) -> Tuple[str, str]:
+        """
+        부분 텍스트를 처리하고 완성된 부분만 반환합니다.
+
+        완성된 문장이나 단락 단위로 텍스트를 분할하여 처리합니다.
+        완성된 부분에 대해서만 기본적인 후처리를 수행하고,
+        나머지는 다음 청크와 함께 처리할 수 있도록 버퍼로 유지합니다.
+
+        Args:
+            text: 처리할 텍스트 버퍼
+
+        Returns:
+            tuple: (처리된_텍스트, 남은_버퍼)
+        """
+        # 완성된 문장 또는 단락 식별
+        complete_text, remaining = self._split_at_sentence_boundary(text)
+
+        # 완성된 부분이 없으면 버퍼 유지
+        if not complete_text:
+            return "", text
+
+        # 말줄임표 패턴이 있으면 제거 (연속된 청크에서 반복되는 패턴 방지)
+        complete_text = self.ellipsis_pattern.sub('', complete_text)
+
+        # 기본 처리: URL을 링크로 변환
+        # 가벼운 처리만 실시간으로 수행 (무거운 처리는 최종 단계에서)
+        processed = self.search_engine.replace_urls_with_links(complete_text)
+
+        # 전체 텍스트 누적 및 처리된 청크 저장
+        self.full_text += complete_text
+        self.processed_chunks.append(processed)
+
+        return processed, remaining
+
+    @classmethod
+    def _split_at_sentence_boundary(cls, text: str) -> Tuple[str, str]:
+        """
+        텍스트를 완성된 문장 또는 단락 경계에서 분할합니다.
+
+        Args:
+            text: 분할할 텍스트
+
+        Returns:
+            tuple: (완성된_부분, 남은_부분)
+        """
+        # 문장 또는 단락 종료 마커
+        end_markers = ['. ', '! ', '? ', '.\n', '!\n', '?\n', '\n\n']
+        last_end = 0
+
+        for marker in end_markers:
+            pos = text.rfind(marker)
+            if pos > last_end:
+                last_end = pos + len(marker)
+
+        # 문장 종료 마커가 없으면 빈 문자열과 원본 텍스트 반환
+        if last_end == 0:
+            return "", text
+
+        # 완성된 부분과 남은 부분 분리
+        return text[:last_end], text[last_end:]
+
+    async def finalize(self, remaining_text: str) -> str:
+        """
+        남은 텍스트와 전체 응답에 대한 최종 후처리를 수행합니다.
+
+        참조 추가, VOC 처리, URL 변환 등의 무거운 처리를 비동기적으로
+        수행하여 최종 응답을 완성합니다.
+
+        Args:
+            remaining_text: 처리할 남은 텍스트
+
+        Returns:
+            str: 최종 처리된 텍스트
+        """
+        session_id = self.request.meta.session_id
+        self.logger.debug(f"[{session_id}] 응답 최종 처리 시작")
+
+        # 남은 텍스트 누적
+        if remaining_text:
+            self.full_text += remaining_text
+
+        # 남은 텍스트가 없으면 빈 문자열 반환
+        if not remaining_text:
+            return ""
+
+        try:
+            # 언어 설정 가져오기
+            _, _, reference_word = self.response_generator.get_translation_language_word(
+                self.request.chat.lang
+            )
+
+            processed_text = remaining_text
+
+            # 무거운 처리는 비동기적으로 수행
+            # 1. 참조 추가 (설정된 경우에만)
+            if settings.prompt.source_count:
+                processed_text = await asyncio.to_thread(
+                    self.response_generator.make_answer_reference,
+                    processed_text,
+                    self.request.meta.rag_sys_info,
+                    reference_word,
+                    self.documents,
+                    self.request
+                )
+
+            # 2. VOC 처리 (해당 시스템인 경우에만)
+            if "komico_voc" in settings.voc.voc_type.split(',') and self.request.meta.rag_sys_info == "komico_voc":
+                processed_text = await asyncio.to_thread(
+                    self.voc_processor.make_komico_voc_groupware_docid_url,
+                    processed_text
+                )
+
+            # 3. URL 처리
+            final_text = await asyncio.to_thread(
+                self.search_engine.replace_urls_with_links,
+                processed_text
+            )
+
+            self.logger.debug(f"[{session_id}] 응답 최종 처리 완료")
+            return final_text
+
+        except Exception as e:
+            self.logger.error(f"[{session_id}] 응답 최종 처리 중 오류: {str(e)}", exc_info=True)
+            return remaining_text  # 오류 발생 시 원본 텍스트 반환
+
+    def get_full_text(self) -> str:
+        """
+        처리된 전체 텍스트를 반환합니다.
+
+        채팅 이력 저장 등의 용도로 사용됩니다.
+
+        Returns:
+            str: 전체 응답 텍스트
+        """
+        return self.full_text
+
+    async def process_full_response(self) -> str:
+        """
+        전체 누적된 응답에 대한 전체 후처리를 수행합니다.
+
+        스트리밍이 완료된 후 전체 응답에 대해 완전한 후처리를
+        수행하고자 할 때 사용합니다.
+
+        Returns:
+            str: 완전히 처리된 응답 텍스트
+        """
+        session_id = self.request.meta.session_id
+        self.logger.debug(f"[{session_id}] 전체 응답 후처리 시작")
+
+        try:
+            # 언어 설정 가져오기
+            _, _, reference_word = self.response_generator.get_translation_language_word(
+                self.request.chat.lang
+            )
+
+            # 1. 참조 추가
+            if settings.prompt.source_count:
+                processed = await asyncio.to_thread(
+                    self.response_generator.make_answer_reference,
+                    self.full_text,
+                    self.request.meta.rag_sys_info,
+                    reference_word,
+                    self.documents,
+                    self.request
+                )
+            else:
+                processed = self.full_text
+
+            # 2. VOC 처리
+            if "komico_voc" in settings.voc.voc_type.split(',') and self.request.meta.rag_sys_info == "komico_voc":
+                processed = await asyncio.to_thread(
+                    self.voc_processor.make_komico_voc_groupware_docid_url,
+                    processed
+                )
+
+            # 3. URL 처리
+            final = await asyncio.to_thread(
+                self.search_engine.replace_urls_with_links,
+                processed
+            )
+
+            self.logger.debug(f"[{session_id}] 전체 응답 후처리 완료")
+            return final
+
+        except Exception as e:
+            self.logger.error(f"[{session_id}] 전체 응답 처리 중 오류: {str(e)}", exc_info=True)
+            return self.full_text
