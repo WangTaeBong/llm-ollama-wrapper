@@ -337,11 +337,73 @@ class LlmHistoryHandler:
             })
 
         vllm_inquery_context = self.build_system_prompt(rag_prompt_template, common_input)
-        vllm_request = VllmInquery(session_id=self.request.meta.session_id, vllm_inquery=vllm_inquery_context)
+        vllm_request = VllmInquery(request_id=self.request.meta.session_id, prompt=vllm_inquery_context)
         response = await self.call_vllm_endpoint(vllm_request)
         answer = response.get("answer", "")
 
         return answer, retrieval_document
+
+    async def handle_chat_with_history_vllm_streaming(self,
+                                                      request: ChatRequest,
+                                                      language: str):
+        """
+        VLLM을 사용하여 스트리밍 모드로 세션 히스토리 기반 채팅 요청 처리.
+
+        Args:
+            request (ChatRequest): 채팅 요청.
+            language (str): 채팅 언어.
+
+        Returns:
+            tuple: (vllm_request, retrieval_document) - 스트리밍용 요청 객체와 검색된 문서
+        """
+        rag_prompt_template = self.response_generator.get_rag_qa_prompt(self.current_rag_sys_info)
+
+        # 검색 문서 가져오기
+        logger.debug(f"[{self.current_session_id}] 스트리밍용 검색 문서 가져오기 시작.")
+        retrieval_document = await self.retriever.ainvoke(request.chat.user)
+        logger.debug(f"[{self.current_session_id}] 스트리밍용 검색 문서 가져오기 완료: {len(retrieval_document)}개")
+
+        # 채팅 히스토리 가져오기
+        chat_history = self.get_session_history()
+        logger.debug(f"[{self.current_session_id}] 스트리밍용 {len(chat_history.messages)}개 히스토리 메시지 처리 중")
+
+        # 채팅 히스토리 형식 지정
+        all_history = ""
+        for message in chat_history.messages:
+            role = message.__class__.__name__
+            content = message.content
+            timestamp = message.additional_kwargs.get('timestamp', 'N/A')
+            all_history += f"[{timestamp}] {role}: {content}\n"
+
+        common_input = {
+            "input": request.chat.user,
+            "history": all_history,
+            "context": retrieval_document,
+            "language": language,
+            "today": self.response_generator.get_today(),
+        }
+
+        # VOC 관련 설정 추가 (필요한 경우)
+        if self.request.meta.rag_sys_info == "komico_voc":
+            common_input.update({
+                "gw_doc_id_prefix_url": settings.voc.gw_doc_id_prefix_url,
+                "check_gw_word_link": settings.voc.check_gw_word_link,
+                "check_gw_word": settings.voc.check_gw_word,
+                "check_block_line": settings.voc.check_block_line,
+            })
+
+        # 시스템 프롬프트 생성
+        vllm_inquery_context = self.build_system_prompt(rag_prompt_template, common_input)
+        logger.error(vllm_inquery_context)
+
+        # 스트리밍을 위한 vLLM 요청 생성
+        vllm_request = VllmInquery(
+            request_id=self.current_session_id,
+            prompt=vllm_inquery_context,
+            stream=True  # 스트리밍 모드 활성화
+        )
+
+        return vllm_request, retrieval_document
 
     async def call_vllm_endpoint(self, data: VllmInquery):
         """

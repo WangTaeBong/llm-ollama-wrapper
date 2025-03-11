@@ -1330,14 +1330,15 @@ class ChatService:
 
     async def stream_chat(self, background_tasks: BackgroundTasks = None) -> StreamingResponse:
         """
-        문자 단위 처리를 통한 실시간 스트리밍 응답 제공
+        문자 단위 처리를 통한 실시간 스트리밍 응답 제공, 히스토리 지원 기능 추가
 
         최적화 포인트:
         1. 문자 단위로 더 작은 청크 전송 (문장 완성 기다리지 않음)
         2. 최대 지연 시간 보장으로 응답성 향상
         3. 한글/영어 특성을 고려한 최소 문자 수 설정
-        4. URL 등 특수 패턴은 완성될 때까지 버퍼링
+        4. URL과 같은 특수 패턴은 완성될 때까지 버퍼링
         5. 마지막에 전체 완성된 응답 한번 더 전송 (클라이언트 편의성)
+        6. 채팅 히스토리 기능 통합 지원
 
         Args:
             background_tasks: 백그라운드 작업 처리용 객체
@@ -1409,32 +1410,56 @@ class ChatService:
                 documents
             )
 
-            # 컨텍스트 준비
-            context = {
-                "input": self.request.chat.user,
-                "context": documents,
-                "language": lang,
-                "today": self.response_generator.get_today(),
-            }
-
-            # VOC 관련 설정 추가
-            if self.request.meta.rag_sys_info == "komico_voc":
-                context.update({
-                    "gw_doc_id_prefix_url": settings.voc.gw_doc_id_prefix_url,
-                    "check_gw_word_link": settings.voc.check_gw_word_link,
-                    "check_gw_word": settings.voc.check_gw_word,
-                    "check_block_line": settings.voc.check_block_line,
-                })
-
-            # 시스템 프롬프트 생성
-            vllm_inquery_context = self.llm_service.build_system_prompt(context)
-
             # vLLM 요청 준비
-            vllm_request = VllmInquery(
-                request_id=session_id,
-                prompt=vllm_inquery_context,
-                stream=True  # 스트리밍 모드 활성화
-            )
+            vllm_url = settings.vllm.endpoint_url
+            retrieval_document = documents
+
+            # 히스토리 기능이 활성화된 경우의 처리
+            if settings.chat_history.enabled and hasattr(self, 'history_handler'):
+                await self._log("info", f"[{session_id}] 히스토리 기능이 활성화된 상태로 스트리밍 처리 진행", session_id=session_id)
+
+                # 히스토리 핸들러에 검색기 초기화
+                await self.history_handler.init_retriever(documents)
+
+                # 히스토리를 포함한 스트리밍 요청 생성
+                vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_vllm_streaming(
+                    self.request, trans_lang
+                )
+
+                # 문서 업데이트
+                if retrieval_document and retrieval_document != documents:
+                    await self._log("debug", f"[{session_id}] 히스토리 검색 문서로 업데이트: {len(retrieval_document)}개",
+                                    session_id=session_id)
+                    # 포스트 프로세서의 문서도 업데이트
+                    post_processor.documents = retrieval_document
+            else:
+                # 히스토리 없는 일반 스트리밍 처리
+                # 컨텍스트 준비
+                context = {
+                    "input": self.request.chat.user,
+                    "context": documents,
+                    "language": lang,
+                    "today": self.response_generator.get_today(),
+                }
+
+                # VOC 관련 설정 추가
+                if self.request.meta.rag_sys_info == "komico_voc":
+                    context.update({
+                        "gw_doc_id_prefix_url": settings.voc.gw_doc_id_prefix_url,
+                        "check_gw_word_link": settings.voc.check_gw_word_link,
+                        "check_gw_word": settings.voc.check_gw_word,
+                        "check_block_line": settings.voc.check_block_line,
+                    })
+
+                # 시스템 프롬프트 생성
+                vllm_inquery_context = self.llm_service.build_system_prompt(context)
+
+                # 일반 vLLM 요청 준비
+                vllm_request = VllmInquery(
+                    request_id=session_id,
+                    prompt=vllm_inquery_context,
+                    stream=True  # 스트리밍 모드 활성화
+                )
 
             # 문자 단위 배치 설정
             char_buffer = ""  # 문자 버퍼
@@ -1452,7 +1477,6 @@ class ChatService:
                 try:
                     # vLLM 엔드포인트 호출
                     from src.common.restclient import rc
-                    vllm_url = settings.vllm.endpoint_url
 
                     # 스트리밍 처리
                     async for chunk in rc.restapi_stream_async(session_id, vllm_url, vllm_request):
@@ -1477,6 +1501,7 @@ class ChatService:
 
                                 # 처리된 텍스트가 있으면 즉시 전송
                                 if processed_text:
+                                    logger.error(processed_text)
                                     json_data = json.dumps(
                                         {'text': processed_text, 'finished': False},
                                         ensure_ascii=False
@@ -1487,6 +1512,7 @@ class ChatService:
                                 # 시간 기반 강제 전송 확인
                                 elapsed_since_send = current_time - last_send_time
                                 if char_buffer and elapsed_since_send > (max_buffer_time / 1000):
+                                    logger.error(char_buffer)
                                     # 최대 지연 시간 초과 시 현재 버퍼 강제 전송
                                     json_data = json.dumps(
                                         {'text': char_buffer, 'finished': False},
