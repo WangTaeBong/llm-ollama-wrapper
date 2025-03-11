@@ -24,8 +24,8 @@ Dependencies:
 """
 
 import asyncio
-import json
 import inspect
+import json
 import logging
 import random
 import re
@@ -34,7 +34,7 @@ from asyncio import Semaphore, create_task, wait_for, TimeoutError
 from contextlib import asynccontextmanager
 from functools import lru_cache, wraps
 from threading import Lock
-from typing import Tuple, Optional, List
+from typing import Tuple
 
 from cachetools import TTLCache
 from fastapi import FastAPI, BackgroundTasks
@@ -1330,35 +1330,37 @@ class ChatService:
 
     async def stream_chat(self, background_tasks: BackgroundTasks = None) -> StreamingResponse:
         """
-        스트리밍 방식으로 채팅 요청을 처리하는 메서드
+        문자 단위 처리를 통한 실시간 스트리밍 응답 제공
 
-        점진적으로 생성되는 LLM 응답을 클라이언트에게 제공하여
-        더 빠른 응답 시작 시간과 사용자 경험을 제공.
+        최적화 포인트:
+        1. 문자 단위로 더 작은 청크 전송 (문장 완성 기다리지 않음)
+        2. 최대 지연 시간 보장으로 응답성 향상
+        3. 한글/영어 특성을 고려한 최소 문자 수 설정
+        4. URL 등 특수 패턴은 완성될 때까지 버퍼링
 
         Args:
-            background_tasks: 백그라운드 작업 실행을 위한 FastAPI BackgroundTasks 객체
+            background_tasks: 백그라운드 작업 처리용 객체
 
         Returns:
             StreamingResponse: 스트리밍 응답 객체
         """
         session_id = self.request.meta.session_id
-        await self._log("info", f"[{session_id}] 스트리밍 채팅 요청 처리 시작", session_id=session_id)
+        await self._log("info", f"[{session_id}] 문자 단위 스트리밍 채팅 요청 시작", session_id=session_id)
 
-        # 타이머 초기화
+        # 처리 시간 측정 시작
         self.start_time = time.time()
         self.processing_stages = {}
 
         try:
-            # 인사말 또는 필터링 체크
+            # 인사말 또는 간단한 응답 처리
             greeting_response = await self._handle_greeting_or_filter()
             if greeting_response:
                 elapsed = self._record_stage("greeting_filter")
-                await self._log("info", f"[{session_id}] 인사말/필터 단계 완료: {elapsed:.4f}초 소요",
-                                session_id=session_id)
+                await self._log("info", f"[{session_id}] 인사말/필터 단계 완료: {elapsed:.4f}초 소요", session_id=session_id)
 
-                # 단순 응답은 스트리밍이 필요없어 일반 텍스트로 반환
+                # 간단한 응답은 바로 반환
                 async def simple_stream():
-                    yield f"data: {json.dumps({'text': greeting_response.chat.system, 'finished': True})}\n\n"
+                    yield f"data: {json.dumps({'text': greeting_response.chat.system, 'finished': True}, ensure_ascii=False)}\n\n"
 
                 return StreamingResponse(simple_stream(), media_type="text/event-stream")
 
@@ -1366,7 +1368,7 @@ class ChatService:
             retrieval_task = asyncio.create_task(self._retrieve_documents())
             language_task = asyncio.create_task(self._get_language_settings())
 
-            # 병렬 작업 완료 대기
+            # 작업 완료 대기
             await asyncio.gather(retrieval_task, language_task)
 
             # 결과 수집
@@ -1385,14 +1387,14 @@ class ChatService:
             if settings.llm.llm_backend.lower() != "vllm":
                 await self._log("error", f"[{session_id}] 스트리밍은 vLLM 백엔드에서만 지원됩니다.")
 
-                # 오류 응답 스트림
+                # 오류 메시지 스트림으로 반환
                 async def error_stream():
                     error_msg = "스트리밍은 vLLM 백엔드에서만 지원됩니다."
-                    yield f"data: {json.dumps({'error': True, 'text': error_msg, 'finished': True})}\n\n"
+                    yield f"data: {json.dumps({'error': True, 'text': error_msg, 'finished': True}, ensure_ascii=False)}\n\n"
 
                 return StreamingResponse(error_stream(), media_type="text/event-stream")
 
-            # 후처리기 초기화
+            # 문자 단위 처리 프로세서 초기화
             post_processor = StreamResponsePostProcessor(
                 self.response_generator,
                 self.voc_processor,
@@ -1401,7 +1403,7 @@ class ChatService:
                 documents
             )
 
-            # 스트리밍 컨텍스트 준비
+            # 컨텍스트 준비
             context = {
                 "input": self.request.chat.user,
                 "context": documents,
@@ -1409,7 +1411,7 @@ class ChatService:
                 "today": self.response_generator.get_today(),
             }
 
-            # VOC 관련 컨텍스트 추가
+            # VOC 관련 설정 추가
             if self.request.meta.rag_sys_info == "komico_voc":
                 context.update({
                     "gw_doc_id_prefix_url": settings.voc.gw_doc_id_prefix_url,
@@ -1421,17 +1423,23 @@ class ChatService:
             # 시스템 프롬프트 생성
             vllm_inquery_context = self.llm_service.build_system_prompt(context)
 
-            # vLLM 요청 객체 생성
+            # vLLM 요청 준비
             vllm_request = VllmInquery(
                 request_id=session_id,
                 prompt=vllm_inquery_context,
                 stream=True  # 스트리밍 모드 활성화
             )
 
-            # 스트리밍 응답 생성 함수
+            # 문자 단위 배치 설정
+            char_buffer = ""  # 문자 버퍼
+            max_buffer_time = 100  # 최대 100ms 지연 허용
+            min_chars_to_send = 2  # 최소 2자 이상일 때 전송 (한글 자모 조합 고려)
+            last_send_time = time.time()  # 마지막 전송 시간
+
+            # 스트리밍 응답 생성
             async def generate_stream():
+                nonlocal char_buffer, last_send_time
                 start_llm_time = time.time()
-                buffer = ""  # 텍스트 버퍼
                 error_occurred = False
 
                 try:
@@ -1439,71 +1447,78 @@ class ChatService:
                     from src.common.restclient import rc
                     vllm_url = settings.vllm.endpoint_url
 
-                    # 스트리밍 응답 처리
+                    # 스트리밍 처리
                     async for chunk in rc.restapi_stream_async(session_id, vllm_url, vllm_request):
+                        current_time = time.time()
+
+                        # 빈 청크 스킵
                         if chunk is None:
                             continue
 
+                        # 청크 유형에 따른 처리
                         if isinstance(chunk, dict):
-                            # 새 텍스트가 있는 경우
+                            # 텍스트 청크 처리
                             if 'new_text' in chunk:
                                 text_chunk = chunk.get('new_text', '')
                                 is_finished = chunk.get('finished', False)
 
-                                # 버퍼에 텍스트 추가
-                                buffer += text_chunk
+                                # 문자 버퍼에 추가
+                                char_buffer += text_chunk
 
-                                # 부분 처리 수행
-                                processed_text, buffer = post_processor.process_partial(buffer)
+                                # 문자 단위 처리
+                                processed_text, char_buffer = post_processor.process_partial(char_buffer)
 
+                                # 처리된 텍스트가 있으면 즉시 전송
                                 if processed_text:
-                                    # 처리된 텍스트가 있으면 전송
-                                    # 중요: JSON 직렬화 시 ensure_ascii=False 설정으로 한글이 이스케이프되지 않도록 함
                                     json_data = json.dumps(
                                         {'text': processed_text, 'finished': False},
                                         ensure_ascii=False
                                     )
                                     yield f"data: {json_data}\n\n"
+                                    last_send_time = current_time
 
-                                # 마지막 청크인 경우
+                                # 시간 기반 강제 전송 확인
+                                elapsed_since_send = current_time - last_send_time
+                                if char_buffer and elapsed_since_send > (max_buffer_time / 1000):
+                                    # 최대 지연 시간 초과 시 현재 버퍼 강제 전송
+                                    json_data = json.dumps(
+                                        {'text': char_buffer, 'finished': False},
+                                        ensure_ascii=False
+                                    )
+                                    yield f"data: {json_data}\n\n"
+                                    char_buffer = ""
+                                    last_send_time = current_time
+
+                                # 완료 신호 처리
                                 if is_finished:
-                                    final_text = await post_processor.finalize(buffer)
-                                    if final_text:
-                                        # 중요: JSON 직렬화 시 ensure_ascii=False 설정
-                                        json_data = json.dumps(
-                                            {'text': final_text, 'finished': True},
-                                            ensure_ascii=False
-                                        )
-                                        yield f"data: {json_data}\n\n"
-                                    else:
-                                        yield f"data: {json.dumps({'text': '', 'finished': True}, ensure_ascii=False)}\n\n"
+                                    # 남은 버퍼 및 전체 텍스트 최종 처리
+                                    final_text = await post_processor.finalize(char_buffer)
+                                    json_data = json.dumps(
+                                        {'text': final_text if final_text else "", 'finished': True},
+                                        ensure_ascii=False
+                                    )
+                                    yield f"data: {json_data}\n\n"
                                     break
 
                             # 완료 신호만 있는 경우
                             elif chunk.get('finished', False):
-                                final_text = await post_processor.finalize(buffer)
-                                if final_text:
-                                    # 중요: JSON 직렬화 시 ensure_ascii=False 설정
-                                    json_data = json.dumps(
-                                        {'text': final_text, 'finished': True},
-                                        ensure_ascii=False
-                                    )
-                                else:
-                                    yield f"data: {json.dumps({'text': '', 'finished': True}, ensure_ascii=False)}\n\n"
-                                break
-
-                        # 종료 마커
-                        elif chunk == '[DONE]':
-                            final_text = await post_processor.finalize(buffer)
-                            if final_text:
-                                # 중요: JSON 직렬화 시 ensure_ascii=False 설정
+                                # 남은 버퍼 처리
+                                final_text = await post_processor.finalize(char_buffer)
                                 json_data = json.dumps(
-                                    {'text': final_text, 'finished': True},
+                                    {'text': final_text if final_text else "", 'finished': True},
                                     ensure_ascii=False
                                 )
                                 yield f"data: {json_data}\n\n"
-                            else:
-                                yield f"data: {json.dumps({'text': '', 'finished': True}, ensure_ascii=False)}\n\n"
+                                break
+
+                        # 완료 마커 처리
+                        elif chunk == '[DONE]':
+                            final_text = await post_processor.finalize(char_buffer)
+                            json_data = json.dumps(
+                                {'text': final_text if final_text else "", 'finished': True},
+                                ensure_ascii=False
+                            )
+                            yield f"data: {json_data}\n\n"
                             break
 
                     # LLM 처리 시간 기록
@@ -1521,16 +1536,16 @@ class ChatService:
                         full_text = post_processor.get_full_text()
                         if full_text:
                             if background_tasks:
-                                # BackgroundTasks가 제공된 경우
+                                # BackgroundTasks가 제공된 경우 활용
                                 background_tasks.add_task(self._save_chat_history, full_text)
                             else:
-                                # 없으면 직접 Task 생성
+                                # 없으면 직접 태스크 생성
                                 self._fire_and_forget(self._save_chat_history(full_text))
 
-                except Exception as err:
+                except Exception as e:
                     error_occurred = True
-                    await self._log("error", f"[{session_id}] 스트리밍 처리 중 오류: {str(err)}", exc_info=True)
-                    # 중요: JSON 직렬화 시 ensure_ascii=False 설정
+                    await self._log("error", f"[{session_id}] 스트리밍 처리 중 오류: {str(e)}", exc_info=True)
+                    # 오류 정보 전송
                     error_json = json.dumps(
                         {'error': True, 'text': str(e), 'finished': True},
                         ensure_ascii=False
@@ -1538,7 +1553,7 @@ class ChatService:
                     yield f"data: {error_json}\n\n"
 
                 finally:
-                    # 전체 처리 시간 계산
+                    # 총 처리 시간 계산
                     if not error_occurred:
                         total_time = sum(self.processing_stages.values())
                         await self._log(
@@ -1558,9 +1573,9 @@ class ChatService:
             await self._log("error", f"[{session_id}] 스트리밍 초기화 중 오류: {str(e)}",
                             session_id=session_id, exc_info=True)
 
-            # 오류 응답 스트림
+            # 오류 스트림 반환
             async def error_stream():
-                yield f"data: {json.dumps({'error': True, 'text': f'처리 중 오류가 발생했습니다: {str(e)}', 'finished': True})}\n\n"
+                yield f"data: {json.dumps({'error': True, 'text': f'처리 중 오류가 발생했습니다: {str(e)}', 'finished': True}, ensure_ascii=False)}\n\n"
 
             return StreamingResponse(
                 error_stream(),
@@ -1961,24 +1976,17 @@ class ChatService:
 
 class StreamResponsePostProcessor:
     """
-    스트리밍 응답의 점진적 후처리를 담당하는 클래스
+    스트리밍 응답을 문자 단위로 처리하여 보다 빠른 사용자 경험 제공
 
-    LLM에서 제공되는 텍스트 청크를 실시간으로 처리하고
-    완성된 문장이나 단락 단위로 부분 처리하며,
-    최종적으로 전체 텍스트에 대한 완전한 후처리를 수행합니다.
+    최적화 포인트:
+    1. 문장 완성을 기다리지 않고 문자 단위로 처리
+    2. 최소 표시 단위 설정으로 자연스러운 흐름 유지
+    3. 특수 문자 처리로 텍스트 일관성 보장
+    4. URL과 같은 특수 패턴은 여전히 완성 후 처리
     """
 
     def __init__(self, response_generator, voc_processor, search_engine, request, documents):
-        """
-        후처리기 초기화
-
-        Args:
-            response_generator: 응답 생성 및 참조 처리 담당 객체
-            voc_processor: VOC 처리 담당 객체
-            search_engine: URL 변환 및 검색 기능 담당 객체
-            request: 원본 채팅 요청
-            documents: 검색된 문서 목록
-        """
+        """초기화"""
         self.response_generator = response_generator
         self.voc_processor = voc_processor
         self.search_engine = search_engine
@@ -1986,98 +1994,119 @@ class StreamResponsePostProcessor:
         self.documents = documents
         self.logger = logging.getLogger(__name__)
 
-        # 전체 응답 텍스트 저장용 변수
+        # 전체 응답 저장
         self.full_text = ""
-
-        # 처리된 청크들 저장
         self.processed_chunks = []
 
-        # 말줄임표 패턴 (응답 중 LLM이 생성하는 임시 패턴) 제거용
-        self.ellipsis_pattern = re.compile(r'\.\.\.$')
+        # 처리 설정
+        self.min_chars = 2  # 한글은 자모 조합 고려해 최소 2자 이상일 때 전송
+        self.force_interval = 100  # 최대 100ms 이상 지연되지 않도록 함
+        self.last_send_time = time.time()
+
+        # URL 및 특수 패턴 감지용
+        self.url_pattern = re.compile(r'https?://\S+')
+        self.url_buffer = ""  # URL 완성까지 임시 저장
+        self.in_url = False  # URL 처리 중 상태
 
     def process_partial(self, text: str) -> Tuple[str, str]:
         """
-        부분 텍스트를 처리하고 완성된 부분만 반환합니다.
-
-        완성된 문장이나 단락 단위로 텍스트를 분할하여 처리합니다.
-        완성된 부분에 대해서만 기본적인 후처리를 수행하고,
-        나머지는 다음 청크와 함께 처리할 수 있도록 버퍼로 유지합니다.
+        문자 단위로 텍스트 처리 - 문장 완성을 기다리지 않음
 
         Args:
-            text: 처리할 텍스트 버퍼
+            text: 처리할 텍스트
 
         Returns:
             tuple: (처리된_텍스트, 남은_버퍼)
         """
-        # 완성된 문장 또는 단락 식별
-        complete_text, remaining = self._split_at_sentence_boundary(text)
+        current_time = time.time()
+        force_send = (current_time - self.last_send_time) > (self.force_interval / 1000)
 
-        # 완성된 부분이 없으면 버퍼 유지
-        if not complete_text:
-            return "", text
+        # 텍스트가 없으면 처리하지 않음
+        if not text:
+            return "", ""
 
-        # 말줄임표 패턴이 있으면 제거 (연속된 청크에서 반복되는 패턴 방지)
-        complete_text = self.ellipsis_pattern.sub('', complete_text)
+        # URL 패턴 검사 - URL은 완성될 때까지 버퍼링
+        if self.in_url:
+            # URL 종료 조건 확인 (공백, 줄바꿈 등)
+            end_idx = -1
+            for i, char in enumerate(text):
+                if char.isspace():
+                    end_idx = i
+                    break
 
-        # 기본 처리: URL을 링크로 변환
-        # 가벼운 처리만 실시간으로 수행 (무거운 처리는 최종 단계에서)
-        processed = self.search_engine.replace_urls_with_links(complete_text)
+            if end_idx >= 0:
+                # URL 완성됨
+                self.url_buffer += text[:end_idx]
+                processed_url = self._quick_process_urls(self.url_buffer)
 
-        # 전체 텍스트 누적 및 처리된 청크 저장
-        self.full_text += complete_text
-        self.processed_chunks.append(processed)
+                # 처리 결과와 남은 텍스트 반환
+                self.in_url = False
+                self.full_text += self.url_buffer + text[end_idx:end_idx + 1]
+                remaining = text[end_idx + 1:]
+                self.url_buffer = ""
 
-        return processed, remaining
+                self.last_send_time = current_time
+                return processed_url + text[end_idx:end_idx + 1], remaining
+            else:
+                # URL 계속 축적
+                self.url_buffer += text
+                self.full_text += text
+                return "", ""  # URL 완성될 때까지 출력 보류
 
-    @classmethod
-    def _split_at_sentence_boundary(cls, text: str) -> Tuple[str, str]:
-        """
-        텍스트를 완성된 문장 또는 단락 경계에서 분할합니다.
+        # URL 시작 감지
+        url_match = self.url_pattern.search(text)
+        if url_match:
+            start_idx = url_match.start()
+            if start_idx > 0:
+                # URL 이전 텍스트 처리
+                prefix = text[:start_idx]
+                self.full_text += prefix
 
-        Args:
-            text: 분할할 텍스트
+                # URL 부분 버퍼링 시작
+                self.in_url = True
+                self.url_buffer = text[start_idx:]
 
-        Returns:
-            tuple: (완성된_부분, 남은_부분)
-        """
-        # 문장 또는 단락 종료 마커
-        end_markers = ['. ', '! ', '? ', '.\n', '!\n', '?\n', '\n\n']
-        last_end = 0
+                self.last_send_time = current_time
+                return prefix, ""
+            else:
+                # 텍스트가 URL로 시작함
+                self.in_url = True
+                self.url_buffer = text
+                self.full_text += text
+                return "", ""
 
-        for marker in end_markers:
-            pos = text.rfind(marker)
-            if pos > last_end:
-                last_end = pos + len(marker)
+        # 일반 텍스트 처리 (URL 아님)
+        # 충분한 텍스트가 있거나 강제 전송 조건 충족 시 전송
+        if len(text) >= self.min_chars or force_send:
+            self.full_text += text
+            self.last_send_time = current_time
+            return text, ""
 
-        # 문장 종료 마커가 없으면 빈 문자열과 원본 텍스트 반환
-        if last_end == 0:
-            return "", text
+        # 최소 길이 미달 시 버퍼 유지
+        self.full_text += text
+        return "", ""
 
-        # 완성된 부분과 남은 부분 분리
-        return text[:last_end], text[last_end:]
+    def _quick_process_urls(self, text: str) -> str:
+        """URL을 빠르게 링크로 변환"""
+        return self.url_pattern.sub(lambda m: f'<a href="{m.group(0)}" target="_blank">{m.group(0)}</a>', text)
 
     async def finalize(self, remaining_text: str) -> str:
-        """
-        남은 텍스트와 전체 응답에 대한 최종 후처리를 수행합니다.
-
-        참조 추가, VOC 처리, URL 변환 등의 무거운 처리를 비동기적으로
-        수행하여 최종 응답을 완성합니다.
-
-        Args:
-            remaining_text: 처리할 남은 텍스트
-
-        Returns:
-            str: 최종 처리된 텍스트
-        """
+        """최종 처리 - 참조 및 VOC 처리 등 무거운 작업 수행"""
         session_id = self.request.meta.session_id
         self.logger.debug(f"[{session_id}] 응답 최종 처리 시작")
 
-        # 남은 텍스트 누적
-        if remaining_text:
-            self.full_text += remaining_text
+        # 남은 텍스트 및 URL 버퍼 처리
+        final_text = remaining_text
+        if self.url_buffer:
+            final_text = self.url_buffer + final_text
+            self.url_buffer = ""
+            self.in_url = False
 
-        # 남은 텍스트가 없으면 빈 문자열 반환
-        if not remaining_text:
+        if final_text:
+            self.full_text += final_text
+
+        # 처리할 내용 없으면 빈 문자열 반환
+        if not final_text and not self.full_text:
             return ""
 
         try:
@@ -2086,10 +2115,10 @@ class StreamResponsePostProcessor:
                 self.request.chat.lang
             )
 
-            processed_text = remaining_text
+            # 전체 텍스트에 대한 최종 처리 수행
+            processed_text = self.full_text
 
-            # 무거운 처리는 비동기적으로 수행
-            # 1. 참조 추가 (설정된 경우에만)
+            # 1. 참조 추가
             if settings.prompt.source_count:
                 processed_text = await asyncio.to_thread(
                     self.response_generator.make_answer_reference,
@@ -2100,7 +2129,7 @@ class StreamResponsePostProcessor:
                     self.request
                 )
 
-            # 2. VOC 처리 (해당 시스템인 경우에만)
+            # 2. VOC 처리
             if "komico_voc" in settings.voc.voc_type.split(',') and self.request.meta.rag_sys_info == "komico_voc":
                 processed_text = await asyncio.to_thread(
                     self.voc_processor.make_komico_voc_groupware_docid_url,
@@ -2118,67 +2147,12 @@ class StreamResponsePostProcessor:
 
         except Exception as e:
             self.logger.error(f"[{session_id}] 응답 최종 처리 중 오류: {str(e)}", exc_info=True)
-            return remaining_text  # 오류 발생 시 원본 텍스트 반환
+            # 오류 시 원본 반환
+            return self.full_text
 
     def get_full_text(self) -> str:
-        """
-        처리된 전체 텍스트를 반환합니다.
-
-        채팅 이력 저장 등의 용도로 사용됩니다.
-
-        Returns:
-            str: 전체 응답 텍스트
-        """
+        """전체 응답 텍스트 반환"""
+        # URL 버퍼에 남은 내용도 포함
+        if self.url_buffer:
+            return self.full_text + self.url_buffer
         return self.full_text
-
-    async def process_full_response(self) -> str:
-        """
-        전체 누적된 응답에 대한 전체 후처리를 수행합니다.
-
-        스트리밍이 완료된 후 전체 응답에 대해 완전한 후처리를
-        수행하고자 할 때 사용합니다.
-
-        Returns:
-            str: 완전히 처리된 응답 텍스트
-        """
-        session_id = self.request.meta.session_id
-        self.logger.debug(f"[{session_id}] 전체 응답 후처리 시작")
-
-        try:
-            # 언어 설정 가져오기
-            _, _, reference_word = self.response_generator.get_translation_language_word(
-                self.request.chat.lang
-            )
-
-            # 1. 참조 추가
-            if settings.prompt.source_count:
-                processed = await asyncio.to_thread(
-                    self.response_generator.make_answer_reference,
-                    self.full_text,
-                    self.request.meta.rag_sys_info,
-                    reference_word,
-                    self.documents,
-                    self.request
-                )
-            else:
-                processed = self.full_text
-
-            # 2. VOC 처리
-            if "komico_voc" in settings.voc.voc_type.split(',') and self.request.meta.rag_sys_info == "komico_voc":
-                processed = await asyncio.to_thread(
-                    self.voc_processor.make_komico_voc_groupware_docid_url,
-                    processed
-                )
-
-            # 3. URL 처리
-            final = await asyncio.to_thread(
-                self.search_engine.replace_urls_with_links,
-                processed
-            )
-
-            self.logger.debug(f"[{session_id}] 전체 응답 후처리 완료")
-            return final
-
-        except Exception as e:
-            self.logger.error(f"[{session_id}] 전체 응답 처리 중 오류: {str(e)}", exc_info=True)
-            return self.full_text

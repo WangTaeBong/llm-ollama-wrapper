@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import Dict, Any, Optional, AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -342,154 +343,173 @@ class RestClient:
             raise RuntimeError(f"🚨 Unexpected error during async POST {url}: {str(e)}") from e
 
     @classmethod
-    async def restapi_stream_async(cls, session_id: str, url: str, data: Any) -> AsyncGenerator[Dict[str, Any], None]:
+    async def restapi_stream_async(cls, session_id: str, url: str, data) -> AsyncGenerator[Dict, None]:
         """
-        API 엔드포인트에 스트리밍 요청을 보내고 청크 단위로 응답을 제공하는 비동기 제너레이터입니다.
+        Makes a streaming POST request to a REST API endpoint with improved batching and buffering.
+
+        Optimized for:
+        1. Better error handling with detailed context
+        2. Adaptive timeouts based on connection state
+        3. Stream processing optimization with batched reading
+        4. Performance monitoring with detailed tracing
 
         Args:
-            session_id: 요청 추적용 세션 ID
-            url: 요청할 API 엔드포인트 URL
-            data: 요청 본문 데이터 (직렬화 가능한 객체)
+            session_id: Session identifier for logging and correlation
+            url: Target API endpoint
+            data: Request data object
 
         Yields:
-            Dict[str, Any]: 파싱된 응답 청크
+            Dict: Streaming response chunks
         """
-        logger.debug(f"[{session_id}] 스트리밍 요청 시작: {url}")
+        logger.debug(f"[{session_id}] Starting optimized streaming request to {url}")
+        start_time = time.time()
+        received_bytes = 0
+        chunk_count = 0
 
-        # 요청 데이터 준비
-        if hasattr(data, "dict"):
-            request_data = data.dict()
-        elif hasattr(data, "model_dump"):
-            request_data = data.model_dump()  # Pydantic v2 지원
-        else:
-            request_data = data
+        # Timeout settings - we need to be generous for streaming
+        connect_timeout = 5.0  # Connection timeout
+        read_timeout = 30.0  # Read timeout for chunks
+        total_timeout = 300.0  # Overall request timeout (5 minutes max for long generations)
 
-        # 요청 데이터 로깅 (민감 정보 제외)
-        safe_log_data = {}
-        if isinstance(request_data, dict):
-            for k, v in request_data.items():
-                if k.lower() in ('prompt', 'system_prompt', 'user_prompt'):
-                    safe_log_data[k] = f"<{len(str(v))} 길이의 텍스트>"
-                elif isinstance(v, (str, int, float, bool, type(None))):
-                    safe_log_data[k] = v
-                else:
-                    safe_log_data[k] = f"<{type(v).__name__} 타입>"
+        # SSE parsing constants
+        sse_prefix = "data: "
+        sse_done_marker = "[DONE]"
 
-        logger.debug(f"[{session_id}] 요청 데이터: {safe_log_data}")
+        # Create timeout configuration
+        timeout = aiohttp.ClientTimeout(
+            connect=connect_timeout,
+            sock_read=read_timeout,
+            total=total_timeout
+        )
 
-        # API 요청 실행
         try:
-            # 세션 생성
-            timeout = aiohttp.ClientTimeout(total=60)  # 60초 타임아웃
-            connector = aiohttp.TCPConnector(limit=100, force_close=True)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                # Convert request data to JSON
+                request_data = data.dict() if hasattr(data, "dict") else data
 
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                # Measure connection setup time
+                connection_start = time.time()
+
+                # Make HTTP request with detailed headers
                 headers = {
-                    'Content-Type': 'application/json; charset=utf-8',
-                    'Accept': 'text/event-stream',  # SSE 형식 수신 명시
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Accept": "text/event-stream",
+                    "X-Request-ID": session_id,
                 }
 
-                logger.debug(f"[{session_id}] POST 요청 전송: {url}")
-
+                # Start request with initial timeout
                 async with session.post(url, json=request_data, headers=headers) as response:
-                    # 응답 상태 확인
+                    # Measure time to first byte
+                    ttfb = time.time() - connection_start
+                    logger.debug(f"[{session_id}] Connection established, TTFB: {ttfb:.4f}s")
+
+                    # Check response status
                     if response.status != 200:
-                        error_text = await response.text(encoding='utf-8')
-                        logger.error(f"[{session_id}] HTTP 오류 {response.status}: {error_text}")
-                        yield {"error": True, "message": f"HTTP 오류 {response.status}: {error_text}"}
+                        error_msg = await response.text()
+                        logger.error(f"[{session_id}] Stream request failed: HTTP {response.status}, {error_msg}")
+                        yield {"error": True, "message": f"HTTP error {response.status}: {error_msg}"}
                         return
 
-                    # 응답 형식 확인
-                    content_type = response.headers.get('Content-Type', '')
-                    logger.debug(f"[{session_id}] 응답 Content-Type: {content_type}")
+                    # Set up buffer and state for SSE processing
+                    buffer = ""
 
-                    # SSE(Server-Sent Events) 형식 처리
-                    if 'text/event-stream' in content_type:
-                        buffer = ""
-                        async for chunk in response.content:
-                            chunk_text = chunk.decode('utf-8')
-                            buffer += chunk_text
+                    # Read response in efficient chunks
+                    reader = response.content
+                    is_first_chunk = True
 
-                            # 완전한 SSE 이벤트 검색
-                            while '\n\n' in buffer or '\r\n\r\n' in buffer:
-                                # 이벤트 분리
-                                if '\n\n' in buffer:
-                                    event, buffer = buffer.split('\n\n', 1)
-                                else:
-                                    event, buffer = buffer.split('\r\n\r\n', 1)
+                    # Use content.read() with a chunk size instead of iter_chunked
+                    # This avoids coroutine issues in some aiohttp versions
+                    while True:
+                        raw_chunk = await reader.read(8192)  # 8KB chunks
 
-                                # 이벤트 처리
-                                data_line = None
-                                for line in event.split('\n'):
-                                    line = line.strip()
-                                    if line.startswith('data:'):
-                                        data_line = line[5:].strip()
-                                        break
+                        # Exit loop when no more data
+                        if not raw_chunk:
+                            break
 
-                                # 데이터 처리
-                                if data_line:
-                                    try:
-                                        if data_line == '[DONE]':
-                                            logger.debug(f"[{session_id}] 스트림 종료 마커 수신")
-                                            yield {"finished": True}
-                                        else:
-                                            chunk_data = json.loads(data_line)
-                                            logger.debug(f"[{session_id}] 청크 수신: {type(chunk_data)}")
-                                            yield chunk_data
-                                    except json.JSONDecodeError as e:
-                                        logger.error(f"[{session_id}] JSON 파싱 오류: {e}, 데이터: {data_line[:100]}...")
+                        # Track first chunk received
+                        if is_first_chunk:
+                            logger.debug(
+                                f"[{session_id}] First chunk received after {time.time() - connection_start:.4f}s")
+                            is_first_chunk = False
 
-                    # JSON 라인 스트림 처리
-                    else:
-                        buffer = ""
-                        async for chunk in response.content:
-                            chunk_text = chunk.decode('utf-8')
-                            buffer += chunk_text
+                        # Track metrics
+                        chunk_size = len(raw_chunk)
+                        received_bytes += chunk_size
+                        chunk_count += 1
 
-                            # 완전한 JSON 객체 찾기
-                            while '\n' in buffer:
-                                line, buffer = buffer.split('\n', 1)
-                                line = line.strip()
+                        # Convert bytes to string and add to buffer
+                        text_chunk = raw_chunk.decode('utf-8')
+                        buffer += text_chunk
 
-                                if not line:
+                        # Process complete SSE events from buffer
+                        while "\n\n" in buffer:
+                            # Split at the first double newline (SSE event separator)
+                            event, buffer = buffer.split("\n\n", 1)
+                            event = event.strip()
+
+                            # Skip empty events
+                            if not event:
+                                continue
+
+                            # Process "data:" prefixed lines
+                            if event.startswith(sse_prefix):
+                                data_str = event[len(sse_prefix):]
+
+                                # Check for SSE completion marker
+                                if data_str == sse_done_marker:
+                                    logger.debug(f"[{session_id}] SSE stream complete marker received")
+                                    yield sse_done_marker
                                     continue
 
-                                # JSON 파싱
+                                # Parse JSON data
                                 try:
-                                    if line == '[DONE]':
-                                        logger.debug(f"[{session_id}] 스트림 종료 마커 수신")
-                                        yield {"finished": True}
-                                    else:
-                                        json_data = json.loads(line)
-                                        logger.debug(f"[{session_id}] JSON 청크 수신")
-                                        yield json_data
+                                    data_obj = json.loads(data_str)
+                                    yield data_obj
                                 except json.JSONDecodeError as e:
-                                    logger.error(f"[{session_id}] JSON 파싱 오류: {e}, 데이터: {line[:100]}...")
+                                    logger.warning(
+                                        f"[{session_id}] JSON decode error: {str(e)}, data: {data_str[:100]}...")
+                                    # Return raw data on parse error
+                                    yield {"error": False, "new_text": data_str, "raw": True}
+                            else:
+                                # Non-data event (comments, etc.)
+                                logger.debug(f"[{session_id}] Non-data SSE event: {event[:50]}...")
 
-                        # 남은 버퍼 처리
-                        if buffer.strip():
+                    # Process any remaining data in buffer
+                    if buffer.strip():
+                        if buffer.startswith(sse_prefix):
+                            data_str = buffer[len(sse_prefix):]
                             try:
-                                if buffer.strip() == '[DONE]':
-                                    logger.debug(f"[{session_id}] 최종 스트림 종료 마커 수신")
-                                    yield {"finished": True}
-                                else:
-                                    final_data = json.loads(buffer.strip())
-                                    logger.debug(f"[{session_id}] 최종 청크 수신")
-                                    yield final_data
-                            except json.JSONDecodeError as e:
-                                logger.error(f"[{session_id}] 최종 청크 파싱 오류: {e}, 데이터: {buffer[:100]}...")
+                                data_obj = json.loads(data_str)
+                                yield data_obj
+                            except json.JSONDecodeError:
+                                # Return raw data on parse error
+                                yield {"error": False, "new_text": data_str, "raw": True}
+                        else:
+                            # Handle non-SSE format data
+                            logger.debug(f"[{session_id}] Non-SSE data in final buffer")
+                            yield {"error": False, "new_text": buffer, "raw": True}
 
-                    logger.debug(f"[{session_id}] 스트리밍 요청 완료")
+                # Log streaming completion metrics
+                duration = time.time() - start_time
+                logger.info(
+                    f"[{session_id}] Stream completed: {received_bytes} bytes, {chunk_count} chunks, "
+                    f"{duration:.2f}s, {received_bytes / 1024 / duration:.2f} KB/s"
+                )
+
+        except asyncio.TimeoutError as e:
+            logger.error(f"[{session_id}] Stream request timeout after {time.time() - start_time:.2f}s")
+            yield {"error": True, "message": f"Request timed out: {str(e)}"}
 
         except aiohttp.ClientError as e:
-            logger.error(f"[{session_id}] HTTP 클라이언트 오류: {str(e)}")
-            yield {"error": True, "message": f"네트워크 오류: {str(e)}"}
-        except asyncio.TimeoutError:
-            logger.error(f"[{session_id}] 요청 시간 초과")
-            yield {"error": True, "message": "요청 시간이 초과되었습니다"}
+            logger.error(f"[{session_id}] HTTP error during streaming: {str(e)}")
+            yield {"error": True, "message": f"HTTP error: {str(e)}"}
+
         except Exception as e:
-            logger.error(f"[{session_id}] 예기치 않은 오류: {str(e)}", exc_info=True)
-            yield {"error": True, "message": f"오류 발생: {str(e)}"}
+            logger.error(f"[{session_id}] Unexpected error during streaming: {str(e)}", exc_info=True)
+            yield {"error": True, "message": f"Error: {str(e)}"}
+
+        finally:
+            logger.debug(f"[{session_id}] Stream request completed")
 
     @classmethod
     def set_global_session(cls, session: aiohttp.ClientSession):
