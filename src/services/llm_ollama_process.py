@@ -1057,7 +1057,10 @@ class ChatService:
         self.llm_service = LLMService(request)
 
         # Initialize history handler if chat history is enabled in settings
-        self.history_handler = LlmHistoryHandler(mai_chat_llm, self.request) if settings.chat_history.enabled else None
+        self.history_handler = LlmHistoryHandler(
+            mai_chat_llm,
+            self.request,
+            max_history_turns=settings.redis.get_message_count) if settings.chat_history.enabled else None
 
         # Initialize processing components
         self.query_check_dict = QueryCheckDict(settings.lm_check.query_dict_config_path)
