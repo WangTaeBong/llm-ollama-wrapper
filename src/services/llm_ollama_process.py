@@ -601,10 +601,10 @@ class LLMService:
             prompt = self.system_prompt_template.format(**context)
             return prompt
         except KeyError as e:
-            logger.error(f"[{session_id}] Key error in system prompt build: {str(e)}")
-            # Try to format with a placeholder for the missing key
+            # Set missing key to empty string and log as warning instead of error
             missing_key = str(e).strip("'")
-            context[missing_key] = f"[{missing_key} missing]"
+            logger.warning(f"[{session_id}] Key missing in system prompt build: {missing_key}")
+            context[missing_key] = ""
             return self.system_prompt_template.format(**context)
         except Exception as e:
             logger.error(f"[{session_id}] System prompt build failed: {str(e)}")
@@ -1337,6 +1337,7 @@ class ChatService:
         2. 최대 지연 시간 보장으로 응답성 향상
         3. 한글/영어 특성을 고려한 최소 문자 수 설정
         4. URL 등 특수 패턴은 완성될 때까지 버퍼링
+        5. 마지막에 전체 완성된 응답 한번 더 전송 (클라이언트 편의성)
 
         Args:
             background_tasks: 백그라운드 작업 처리용 객체
@@ -1360,7 +1361,12 @@ class ChatService:
 
                 # 간단한 응답은 바로 반환
                 async def simple_stream():
-                    yield f"data: {json.dumps({'text': greeting_response.chat.system, 'finished': True}, ensure_ascii=False)}\n\n"
+                    # 일반 응답 청크
+                    yield f"data: {json.dumps({'text': greeting_response.chat.system, 'finished': False}, ensure_ascii=False)}\n\n"
+                    # 완료 신호 전송
+                    yield f"data: {json.dumps({'text': '', 'finished': True}, ensure_ascii=False)}\n\n"
+                    # 전체 응답 전송
+                    yield f"data: {json.dumps({'complete_response': greeting_response.chat.system}, ensure_ascii=False)}\n\n"
 
                 return StreamingResponse(simple_stream(), media_type="text/event-stream")
 
@@ -1441,6 +1447,7 @@ class ChatService:
                 nonlocal char_buffer, last_send_time
                 start_llm_time = time.time()
                 error_occurred = False
+                full_response = None  # 전체 응답을 저장할 변수
 
                 try:
                     # vLLM 엔드포인트 호출
@@ -1491,10 +1498,28 @@ class ChatService:
 
                                 # 완료 신호 처리
                                 if is_finished:
-                                    # 남은 버퍼 및 전체 텍스트 최종 처리
-                                    final_text = await post_processor.finalize(char_buffer)
+                                    # 남은 버퍼가 있으면 전송
+                                    if char_buffer:
+                                        json_data = json.dumps(
+                                            {'text': char_buffer, 'finished': False},
+                                            ensure_ascii=False
+                                        )
+                                        yield f"data: {json_data}\n\n"
+                                        char_buffer = ""
+
+                                    # 전체 텍스트 최종 처리
+                                    full_response = await post_processor.finalize("")
+
+                                    # 완료 신호 전송 (빈 텍스트, finished=true)
                                     json_data = json.dumps(
-                                        {'text': final_text if final_text else "", 'finished': True},
+                                        {'text': "", 'finished': True},
+                                        ensure_ascii=False
+                                    )
+                                    yield f"data: {json_data}\n\n"
+
+                                    # 전체 완성된 응답 한 번 더 전송
+                                    json_data = json.dumps(
+                                        {'complete_response': full_response},
                                         ensure_ascii=False
                                     )
                                     yield f"data: {json_data}\n\n"
@@ -1503,9 +1528,27 @@ class ChatService:
                             # 완료 신호만 있는 경우
                             elif chunk.get('finished', False):
                                 # 남은 버퍼 처리
-                                final_text = await post_processor.finalize(char_buffer)
+                                if char_buffer:
+                                    json_data = json.dumps(
+                                        {'text': char_buffer, 'finished': False},
+                                        ensure_ascii=False
+                                    )
+                                    yield f"data: {json_data}\n\n"
+                                    char_buffer = ""
+
+                                # 전체 텍스트 최종 처리
+                                full_response = await post_processor.finalize("")
+
+                                # 완료 신호 전송
                                 json_data = json.dumps(
-                                    {'text': final_text if final_text else "", 'finished': True},
+                                    {'text': "", 'finished': True},
+                                    ensure_ascii=False
+                                )
+                                yield f"data: {json_data}\n\n"
+
+                                # 전체 완성된 응답 전송
+                                json_data = json.dumps(
+                                    {'complete_response': full_response},
                                     ensure_ascii=False
                                 )
                                 yield f"data: {json_data}\n\n"
@@ -1513,9 +1556,27 @@ class ChatService:
 
                         # 완료 마커 처리
                         elif chunk == '[DONE]':
-                            final_text = await post_processor.finalize(char_buffer)
+                            if char_buffer:
+                                json_data = json.dumps(
+                                    {'text': char_buffer, 'finished': False},
+                                    ensure_ascii=False
+                                )
+                                yield f"data: {json_data}\n\n"
+                                char_buffer = ""
+
+                            # 전체 텍스트 최종 처리
+                            full_response = await post_processor.finalize("")
+
+                            # 완료 신호 전송
                             json_data = json.dumps(
-                                {'text': final_text if final_text else "", 'finished': True},
+                                {'text': "", 'finished': True},
+                                ensure_ascii=False
+                            )
+                            yield f"data: {json_data}\n\n"
+
+                            # 전체 완성된 응답 전송
+                            json_data = json.dumps(
+                                {'complete_response': full_response},
                                 ensure_ascii=False
                             )
                             yield f"data: {json_data}\n\n"
@@ -1532,15 +1593,13 @@ class ChatService:
                     self._record_stage("llm_processing")
 
                     # 채팅 이력 저장
-                    if settings.chat_history.enabled:
-                        full_text = post_processor.get_full_text()
-                        if full_text:
-                            if background_tasks:
-                                # BackgroundTasks가 제공된 경우 활용
-                                background_tasks.add_task(self._save_chat_history, full_text)
-                            else:
-                                # 없으면 직접 태스크 생성
-                                self._fire_and_forget(self._save_chat_history(full_text))
+                    if settings.chat_history.enabled and full_response:
+                        if background_tasks:
+                            # BackgroundTasks가 제공된 경우 활용
+                            background_tasks.add_task(self._save_chat_history, full_response)
+                        else:
+                            # 없으면 직접 태스크 생성
+                            self._fire_and_forget(self._save_chat_history(full_response))
 
                 except Exception as e:
                     error_occurred = True
@@ -1983,6 +2042,7 @@ class StreamResponsePostProcessor:
     2. 최소 표시 단위 설정으로 자연스러운 흐름 유지
     3. 특수 문자 처리로 텍스트 일관성 보장
     4. URL과 같은 특수 패턴은 여전히 완성 후 처리
+    5. 마지막 청크 전송 후 전체 응답을 완성된 형태로 한 번 더 전송
     """
 
     def __init__(self, response_generator, voc_processor, search_engine, request, documents):
