@@ -1045,6 +1045,10 @@ class ChatService:
     _log_task = None
     _log_initialized = False
 
+    # 캐시 정리 주기
+    _cache_cleanup_interval = 3600  # 1시간마다 캐시 정리
+    _last_cache_cleanup = time.time()
+
     def __init__(self, request: ChatRequest):
         """
         Initialize the chat service with the given request.
@@ -1060,7 +1064,8 @@ class ChatService:
         self.history_handler = LlmHistoryHandler(
             mai_chat_llm,
             self.request,
-            max_history_turns=settings.redis.get_message_count) if settings.chat_history.enabled else None
+            max_history_turns=getattr(settings.chat_history, 'max_turns', 10)
+        )
 
         # Initialize processing components
         self.query_check_dict = QueryCheckDict(settings.lm_check.query_dict_config_path)
@@ -1076,6 +1081,9 @@ class ChatService:
 
         # Create cache key based on session and query
         self.cache_key = f"{self.request.meta.rag_sys_info}:{self.request.meta.session_id}:{self.request.chat.user}"
+
+        # 캐시 정리 확인
+        self._check_cache_cleanup()
 
     async def _ensure_log_task_running(self):
         """
@@ -1335,19 +1343,7 @@ class ChatService:
         """
         문자 단위 처리를 통한 실시간 스트리밍 응답 제공, 히스토리 지원 기능 추가
 
-        최적화 포인트:
-        1. 문자 단위로 더 작은 청크 전송 (문장 완성 기다리지 않음)
-        2. 최대 지연 시간 보장으로 응답성 향상
-        3. 한글/영어 특성을 고려한 최소 문자 수 설정
-        4. URL과 같은 특수 패턴은 완성될 때까지 버퍼링
-        5. 마지막에 전체 완성된 응답 한번 더 전송 (클라이언트 편의성)
-        6. 채팅 히스토리 기능 통합 지원
-
-        Args:
-            background_tasks: 백그라운드 작업 처리용 객체
-
-        Returns:
-            StreamingResponse: 스트리밍 응답 객체
+        LlmHistoryHandler를 활용하여 대화 히스토리 처리
         """
         session_id = self.request.meta.session_id
         await self._log("info", f"[{session_id}] 문자 단위 스트리밍 채팅 요청 시작", session_id=session_id)
@@ -1366,11 +1362,17 @@ class ChatService:
                 # 간단한 응답은 바로 반환
                 async def simple_stream():
                     # 일반 응답 청크
-                    yield f"data: {json.dumps({'text': greeting_response.chat.system, 'finished': False}, ensure_ascii=False)}\n\n"
+                    error_data = {'text': greeting_response.chat.system, 'finished': False}
+                    json_str = json.dumps(error_data, ensure_ascii=False)
+                    yield f"data: {json_str}\n\n"
                     # 완료 신호 전송
-                    yield f"data: {json.dumps({'text': '', 'finished': True}, ensure_ascii=False)}\n\n"
+                    error_data = {'text': '', 'finished': True}
+                    json_str = json.dumps(error_data, ensure_ascii=False)
+                    yield f"data: {json_str}\n\n"
                     # 전체 응답 전송
-                    yield f"data: {json.dumps({'complete_response': greeting_response.chat.system}, ensure_ascii=False)}\n\n"
+                    error_data = {'complete_response': greeting_response.chat.system}
+                    json_str = json.dumps(error_data, ensure_ascii=False)
+                    yield f"data: {json_str}\n\n"
 
                 return StreamingResponse(simple_stream(), media_type="text/event-stream")
 
@@ -1400,7 +1402,9 @@ class ChatService:
                 # 오류 메시지 스트림으로 반환
                 async def error_stream():
                     error_msg = "스트리밍은 vLLM 백엔드에서만 지원됩니다."
-                    yield f"data: {json.dumps({'error': True, 'text': error_msg, 'finished': True}, ensure_ascii=False)}\n\n"
+                    error_data = {'error': True, 'text': error_msg, 'finished': True}
+                    json_str = json.dumps(error_data, ensure_ascii=False)
+                    yield f"data: {json_str}\n\n"
 
                 return StreamingResponse(error_stream(), media_type="text/event-stream")
 
@@ -1415,7 +1419,6 @@ class ChatService:
 
             # vLLM 요청 준비
             vllm_url = settings.vllm.endpoint_url
-            retrieval_document = documents
 
             # 히스토리 기능이 활성화된 경우의 처리
             if settings.chat_history.enabled and hasattr(self, 'history_handler'):
@@ -1424,10 +1427,11 @@ class ChatService:
                 # 히스토리 핸들러에 검색기 초기화
                 await self.history_handler.init_retriever(documents)
 
-                # 히스토리를 포함한 스트리밍 요청 생성
+                # 개선된 LlmHistoryHandler의 스트리밍 메서드 사용
                 vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_vllm_streaming(
                     self.request, trans_lang
                 )
+                logger.info(vllm_request)
 
                 # 문서 업데이트
                 if retrieval_document and retrieval_document != documents:
@@ -1504,7 +1508,6 @@ class ChatService:
 
                                 # 처리된 텍스트가 있으면 즉시 전송
                                 if processed_text:
-                                    logger.error(processed_text)
                                     json_data = json.dumps(
                                         {'text': processed_text, 'finished': False},
                                         ensure_ascii=False
@@ -1515,7 +1518,6 @@ class ChatService:
                                 # 시간 기반 강제 전송 확인
                                 elapsed_since_send = current_time - last_send_time
                                 if char_buffer and elapsed_since_send > (max_buffer_time / 1000):
-                                    logger.error(char_buffer)
                                     # 최대 지연 시간 초과 시 현재 버퍼 강제 전송
                                     json_data = json.dumps(
                                         {'text': char_buffer, 'finished': False},
@@ -1630,12 +1632,12 @@ class ChatService:
                             # 없으면 직접 태스크 생성
                             self._fire_and_forget(self._save_chat_history(full_response))
 
-                except Exception as e:
+                except Exception as err:
                     error_occurred = True
-                    await self._log("error", f"[{session_id}] 스트리밍 처리 중 오류: {str(e)}", exc_info=True)
+                    await self._log("error", f"[{session_id}] 스트리밍 처리 중 오류: {str(err)}", exc_info=True)
                     # 오류 정보 전송
                     error_json = json.dumps(
-                        {'error': True, 'text': str(e), 'finished': True},
+                        {'error': True, 'text': str(err), 'finished': True},
                         ensure_ascii=False
                     )
                     yield f"data: {error_json}\n\n"
@@ -1663,7 +1665,9 @@ class ChatService:
 
             # 오류 스트림 반환
             async def error_stream():
-                yield f"data: {json.dumps({'error': True, 'text': f'처리 중 오류가 발생했습니다: {str(e)}', 'finished': True}, ensure_ascii=False)}\n\n"
+                error_data = {'error': True, 'text': f'처리 중 오류가 발생했습니다: {str(e)}', 'finished': True}
+                json_str = json.dumps(error_data, ensure_ascii=False)
+                yield f"data: {json_str}\n\n"
 
             return StreamingResponse(
                 error_stream(),
@@ -1735,7 +1739,7 @@ class ChatService:
         vllm_retrival_document = None
 
         try:
-            if settings.chat_history.enabled:
+            if settings.chat_history.enabled and hasattr(self, 'history_handler'):
                 # Initialize retriever with documents
                 await self.history_handler.init_retriever(documents)
 
@@ -1747,20 +1751,20 @@ class ChatService:
                         self.request, trans_lang, rag_chat_chain
                     ) or {"context": [], "answer": ""}
 
-                    # Update documents with history context
+                    # Update documents with history context if available
                     context = chat_history_response.get("context", [])
-                    self.request.chat.payload = self.document_processor.convert_document_to_payload(
-                        context
-                    ) + self.request.chat.payload
-
-                    # Update documents
-                    # documents = context + documents
+                    if context:
+                        self.request.chat.payload = self.document_processor.convert_document_to_payload(
+                            context
+                        ) + self.request.chat.payload
 
                     query_answer = chat_history_response.get("answer", "")
 
                 elif settings.llm.llm_backend.lower() == "vllm":
                     # Process chat with history for vLLM
                     await self._log("debug", f"[{session_id}] Processing chat with history for vLLM backend")
+
+                    # 개선된 LlmHistoryHandler 메서드 사용
                     chat_history_result = await self.history_handler.handle_chat_with_history_vllm(
                         self.request, trans_lang
                     )
@@ -1771,47 +1775,77 @@ class ChatService:
                     else:
                         query_answer = ""
                         vllm_retrival_document = []
+
+                    # 히스토리 처리 중 오류 발생 시 로깅
+                    if not query_answer and not vllm_retrival_document:
+                        await self._log("warning",
+                                        f"[{session_id}] 히스토리 처리 결과가 비어 있습니다. 기본 LLM 쿼리로 대체합니다.",
+                                        session_id=session_id)
+                        # 히스토리 처리 실패 시 기본 LLM 쿼리로 대체
+                        query_answer = await self.llm_service.ask(documents, lang)
             else:
                 # Direct LLM query without chat history
                 await self._log("debug", f"[{session_id}] Processing direct LLM query without chat history")
                 query_answer = await self.llm_service.ask(documents, lang)
 
+            # 응답이 비어있을 경우 대체 메시지 제공
+            if not query_answer or query_answer.strip() == "":
+                await self._log("warning",
+                                f"[{session_id}] LLM 응답이 비어 있습니다. 대체 메시지를 제공합니다.",
+                                session_id=session_id)
+                query_answer = "죄송합니다. 현재 응답을 생성할 수 없습니다. 잠시 후 다시 시도해 주세요."
+
             return query_answer, vllm_retrival_document
 
         except Exception as e:
             await self._log("error", f"[{session_id}] Error processing LLM query: {str(e)}", exc_info=True)
-            raise
+            # 오류 발생 시 대체 메시지 제공
+            return "죄송합니다. 질문 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.", None
 
     async def _save_chat_history(self, answer):
         """
         Save chat history to Redis asynchronously.
 
-        This method stores the current conversation exchange in Redis
-        for future reference. It's designed to work asynchronously to
-        avoid blocking the main processing flow.
-
-        Args:
-            answer (str): The generated answer to save
+        개선된 오류 처리와 재시도 메커니즘을 추가하여 안정성 향상
         """
         session_id = self.request.meta.session_id
-        try:
-            await self._log("debug", f"[{session_id}] Saving chat history to Redis")
-            await RedisUtils.async_save_message_to_redis(
-                system_info=self.request.meta.rag_sys_info,
-                session_id=session_id,
-                message=create_chat_data(session_id, [
+        max_retries = 3
+        retry_count = 0
+
+        while retry_count < max_retries:
+            try:
+                await self._log("debug", f"[{session_id}] Saving chat history to Redis (attempt {retry_count + 1})")
+
+                # 메시지 생성
+                chat_data = create_chat_data(session_id, [
                     create_message("HumanMessage", self.request.chat.user),
                     create_message("AIMessage", answer)
                 ])
-            )
-            await self._log("debug", f"[{session_id}] Chat history saved successfully")
-        except Exception as e:
-            await self._log(
-                "error",
-                f"[{session_id}] Failed to save chat history: {str(e)}",
-                exc_info=True
-            )
-            # Continue processing even if history saving fails
+
+                # Redis에 저장
+                await RedisUtils.async_save_message_to_redis(
+                    system_info=self.request.meta.rag_sys_info,
+                    session_id=session_id,
+                    message=chat_data
+                )
+
+                await self._log("debug", f"[{session_id}] Chat history saved successfully")
+                return True
+
+            except Exception as e:
+                retry_count += 1
+                await self._log(
+                    "warning" if retry_count < max_retries else "error",
+                    f"[{session_id}] Failed to save chat history (attempt {retry_count}): {str(e)}",
+                    exc_info=True
+                )
+
+                # 마지막 시도가 아니면 잠시 대기 후 재시도
+                if retry_count < max_retries:
+                    await asyncio.sleep(0.5 * retry_count)  # 점진적 지연
+
+        # 모든 재시도 실패 후에도 처리는 계속 진행
+        return False
 
     async def _handle_greeting_or_filter(self):
         """
@@ -2048,6 +2082,49 @@ class ChatService:
                     info=[],
                 )
             )
+
+    def _check_cache_cleanup(self):
+        """
+        주기적으로 캐시를 정리하여 메모리 사용량 최적화
+        """
+        current_time = time.time()
+        if current_time - ChatService._last_cache_cleanup > ChatService._cache_cleanup_interval:
+            try:
+                # 캐시 크기 체크 및 로깅
+                prompt_cache_size = len(ChatService._prompt_cache)
+                response_cache_size = len(ChatService._response_cache)
+
+                logger.info(
+                    f"Performing periodic cache cleanup. Before: prompt_cache={prompt_cache_size}, "
+                    f"response_cache={response_cache_size}")
+
+                # 오래된 캐시 항목 정리
+                expired_prompt_keys = [k for k, v in ChatService._prompt_cache.items()
+                                       if k.split(':')[1] != self.request.meta.session_id]
+                expired_response_keys = [k for k, v in ChatService._response_cache.items()
+                                         if k.split(':')[1] != self.request.meta.session_id]
+
+                # 다른 세션의 캐시만 일부 정리 (현재 세션 유지)
+                for key in expired_prompt_keys[:max(prompt_cache_size // 2, 10)]:
+                    ChatService._prompt_cache.pop(key, None)
+
+                for key in expired_response_keys[:max(response_cache_size // 2, 20)]:
+                    ChatService._response_cache.pop(key, None)
+
+                # 히스토리 핸들러의 메모리 관리 함수 호출
+                if hasattr(self, 'history_handler'):
+                    self.history_handler.cleanup_processed_sets()
+
+                # 정리 후 크기 확인
+                logger.info(
+                    f"Cache cleanup completed. After: prompt_cache={len(ChatService._prompt_cache)}, "
+                    f"response_cache={len(ChatService._response_cache)}")
+
+                # 타임스탬프 업데이트
+                ChatService._last_cache_cleanup = current_time
+
+            except Exception as e:
+                logger.error(f"Error during cache cleanup: {str(e)}")
 
     @classmethod
     def clear_caches(cls):
