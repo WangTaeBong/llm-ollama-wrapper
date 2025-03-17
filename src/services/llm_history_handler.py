@@ -282,22 +282,66 @@ class LlmHistoryHandler:
         return unique_messages
 
     @classmethod
-    def format_history_for_prompt(cls, session_history: ChatMessageHistory) -> str:
+    def format_history_for_prompt(cls, session_history: ChatMessageHistory, max_turns: int = 5) -> str:
         """
         Format chat history for prompt in a clean, structured format.
 
         Args:
             session_history: The chat message history
+            max_turns: 포함할 최대 대화 턴 수 (기본값: 5)
 
         Returns:
             Formatted history string
         """
+        if not session_history.messages:
+            return ""
+
+            # 가장 최근 대화부터 max_turns 수만큼만 추출
+        messages = session_history.messages
+        if len(messages) > max_turns * 2:  # 각 턴은 사용자 메시지와 시스템 응답을 포함
+            messages = messages[-(max_turns * 2):]
+
         formatted_history = []
 
-        for msg in session_history.messages:
-            # Use roles without timestamps to save tokens
-            role = "Human" if isinstance(msg, HumanMessage) else "Assistant"
-            formatted_history.append(f"{role}: {msg.content}")
+        # 대화 이력 프롬프트 헤더 추가
+        formatted_history.append("# 이전 대화 내용")
+
+        # 대화 턴 구성
+        turns = []
+        current_turn = {"user": None, "assistant": None}
+
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                # 이전 턴이 있으면 저장
+                if current_turn["user"] is not None and current_turn["assistant"] is not None:
+                    turns.append(current_turn)
+                    current_turn = {"user": None, "assistant": None}
+
+                # 현재 사용자 메시지 저장
+                current_turn["user"] = msg.content
+            elif isinstance(msg, AIMessage):
+                current_turn["assistant"] = msg.content
+
+        # 마지막 턴 저장
+        if current_turn["user"] is not None:
+            turns.append(current_turn)
+
+        # 턴 수가 많으면 가장 최근 턴 유지
+        if len(turns) > max_turns:
+            turns = turns[-max_turns:]
+
+        # 형식화된 대화 이력 생성
+        for i, turn in enumerate(turns):
+            formatted_history.append(f"\n## 대화 {i + 1}")
+
+            if turn["user"]:
+                formatted_history.append(f"User: {turn['user']}")
+
+            if turn["assistant"]:
+                formatted_history.append(f"Assistant: {turn['assistant']}")
+
+        # 개선된 프롬프트 지시문 추가
+        formatted_history.append("\n# 현재 질문에 답변할 때 위 대화 내용을 참고하세요.")
 
         return "\n".join(formatted_history)
 
@@ -378,7 +422,7 @@ class LlmHistoryHandler:
 
         # Get chat history in structured format
         session_history = self.get_session_history()
-        formatted_history = self.format_history_for_prompt(session_history)
+        formatted_history = self.format_history_for_prompt(session_history, settings.llm.max_history_turns)
         logger.debug(f"[{self.current_session_id}] Processed {len(session_history.messages)} history messages for VLLM")
 
         # Prepare context for prompt
@@ -413,6 +457,114 @@ class LlmHistoryHandler:
 
         return answer, retrieval_document
 
+    async def handle_chat_with_history_vllm_improved(self,
+                                                     request: ChatRequest,
+                                                     language: str):
+        """
+        vLLM을 사용하여 2단계 접근법으로 대화 이력을 처리합니다.
+        1. 대화 이력과 현재 질문을 사용하여 독립적인 질문 생성
+        2. 독립적인 질문으로 문서를 검색하고 최종 응답 생성
+
+        Args:
+            request (ChatRequest): 채팅 요청
+            language (str): 언어 코드
+
+        Returns:
+            tuple: (answer, retrieval_document)
+        """
+        logger.debug(f"[{self.current_session_id}] 개선된 vLLM 히스토리 처리 시작")
+
+        # 1단계: 대화 이력을 사용하여 독립적인 질문 생성
+        # 대화 이력 가져오기
+        session_history = self.get_session_history()
+        formatted_history = self.format_history_for_prompt(session_history, settings.llm.max_history_turns)
+
+        # 질문 재정의를 위한 프롬프트 템플릿
+        rewrite_prompt_template = """
+    당신은 대화 컨텍스트를 고려하여 사용자의 질문을 명확하고 완전한 형태로 재작성하는 AI 도우미입니다.
+    이전 대화 내용과 현재 질문을 고려하여, 대화 맥락이 충분히 반영된 독립적인 질문으로 재작성해주세요.
+    다음 정보를 고려하세요:
+    1. 현재 질문에서 생략된 맥락을 이전 대화에서 찾아 보완하세요.
+    2. 대명사(이것, 그것, 저것 등)는 실제 지칭하는 대상으로 바꿔주세요.
+    3. 간결하면서도 정확한 질문으로 재작성하세요.
+    4. 재작성된 질문만 출력하세요. 설명이나 다른 텍스트는 포함하지 마세요.
+
+    {history}
+
+    현재 질문: {input}
+
+    재작성된 질문:
+    """
+
+        # 질문 재정의 프롬프트 생성
+        rewrite_context = {
+            "history": formatted_history,
+            "input": request.chat.user,
+        }
+
+        rewrite_prompt = rewrite_prompt_template.format(**rewrite_context)
+
+        # vLLM에 질문 재정의 요청
+        rewrite_request = VllmInquery(
+            request_id=f"{self.current_session_id}_rewrite",
+            prompt=rewrite_prompt
+        )
+
+        logger.debug(f"[{self.current_session_id}] 질문 재정의 vLLM 요청 전송")
+        rewrite_response = await self.call_vllm_endpoint(rewrite_request)
+        rewritten_question = rewrite_response.get("generated_text", "").strip()
+
+        # 재작성된 질문이 없거나 오류 발생 시 원래 질문 사용
+        if not rewritten_question or len(rewritten_question) < 5:
+            logger.warning(f"[{self.current_session_id}] 질문 재정의 실패, 원래 질문 사용")
+            rewritten_question = request.chat.user
+        else:
+            logger.debug(f"[{self.current_session_id}] 질문 재정의 성공: '{rewritten_question}'")
+
+        # 2단계: 재정의된 질문으로 문서 검색
+        logger.debug(f"[{self.current_session_id}] 재정의된 질문으로 문서 검색 시작")
+        retrieval_document = await self.retriever.ainvoke(rewritten_question)
+        logger.debug(f"[{self.current_session_id}] 문서 검색 완료: {len(retrieval_document)}개 문서")
+
+        # 3단계: 최종 응답 생성
+        # RAG 프롬프트 템플릿 가져오기
+        rag_prompt_template = self.response_generator.get_rag_qa_prompt(self.current_rag_sys_info)
+
+        # 최종 응답 생성을 위한 컨텍스트 준비
+        final_prompt_context = {
+            "input": request.chat.user,  # 원래 질문 사용
+            "rewritten_question": rewritten_question,  # 재작성된 질문도 제공
+            "history": formatted_history,  # 형식화된 대화 이력
+            "context": retrieval_document,  # 검색된 문서
+            "language": language,
+            "today": self.response_generator.get_today(),
+        }
+
+        # VOC 관련 설정 추가 (필요한 경우)
+        if self.request.meta.rag_sys_info == "komico_voc":
+            final_prompt_context.update({
+                "gw_doc_id_prefix_url": settings.voc.gw_doc_id_prefix_url,
+                "check_gw_word_link": settings.voc.check_gw_word_link,
+                "check_gw_word": settings.voc.check_gw_word,
+                "check_block_line": settings.voc.check_block_line,
+            })
+
+        # 최종 시스템 프롬프트 생성
+        vllm_inquery_context = self.build_system_prompt_improved(rag_prompt_template, final_prompt_context)
+
+        # vLLM에 최종 응답 요청
+        vllm_request = VllmInquery(
+            request_id=self.request.meta.session_id,
+            prompt=vllm_inquery_context
+        )
+
+        logger.debug(f"[{self.current_session_id}] 최종 응답 생성 vLLM 요청 전송")
+        response = await self.call_vllm_endpoint(vllm_request)
+        answer = response.get("generated_text", "") or response.get("answer", "")
+        logger.debug(f"[{self.current_session_id}] 최종 응답 생성 완료, 응답 길이: {len(answer)}")
+
+        return answer, retrieval_document
+
     async def handle_chat_with_history_vllm_streaming(self,
                                                       request: ChatRequest,
                                                       language: str):
@@ -438,7 +590,7 @@ class LlmHistoryHandler:
 
         # 채팅 히스토리 가져오기 및 최적화
         session_history = self.get_session_history()
-        formatted_history = self.format_history_for_prompt(session_history)
+        formatted_history = self.format_history_for_prompt(session_history, settings.llm.max_history_turns)
         logger.debug(f"[{self.current_session_id}] 스트리밍용 {len(session_history.messages)}개 히스토리 메시지 처리 완료")
 
         # 컨텍스트 준비
@@ -469,7 +621,143 @@ class LlmHistoryHandler:
             stream=True  # 스트리밍 모드 활성화
         )
 
+        logger.info(f"[{self.current_session_id}] 스트리밍 요청을 {settings.vllm.endpoint_url}로 전송합니다")
         logger.debug(f"[{self.current_session_id}] 스트리밍 요청 준비 완료")
+
+        return vllm_request, retrieval_document
+
+    async def handle_chat_with_history_vllm_streaming_improved(self,
+                                                               request: ChatRequest,
+                                                               language: str):
+        """
+        vLLM을 사용하여 2단계 접근법으로 스트리밍 모드의 대화 이력을 처리합니다.
+        1. 대화 이력과 현재 질문을 사용하여 독립적인 질문 생성
+        2. 독립적인 질문으로 문서를 검색하고 스트리밍 응답 생성
+
+        Args:
+            request (ChatRequest): 채팅 요청
+            language (str): 언어 코드
+
+        Returns:
+            tuple: (vllm_request, retrieval_document) - 스트리밍용 요청 객체와 검색된 문서
+        """
+        session_id = self.current_session_id
+        logger.debug(f"[{session_id}] 개선된 vLLM 스트리밍 히스토리 처리 시작")
+
+        # 1단계: 대화 이력을 사용하여 독립적인 질문 생성
+        # 대화 이력 가져오기
+        session_history = self.get_session_history()
+        formatted_history = self.format_history_for_prompt(session_history, settings.llm.max_history_turns)
+
+        # 질문 재정의를 위한 프롬프트 템플릿
+        rewrite_prompt_template = """
+    당신은 대화 컨텍스트를 고려하여 사용자의 질문을 명확하고 완전한 형태로 재작성하는 AI 도우미입니다.
+    이전 대화 내용과 현재 질문을 고려하여, 대화 맥락이 충분히 반영된 독립적인 질문으로 재작성해주세요.
+    다음 정보를 고려하세요:
+    1. 현재 질문에서 생략된 맥락을 이전 대화에서 찾아 보완하세요.
+    2. 대명사(이것, 그것, 저것 등)는 실제 지칭하는 대상으로 바꿔주세요.
+    3. 간결하면서도 정확한 질문으로 재작성하세요.
+    4. 재작성된 질문만 출력하세요. 설명이나 다른 텍스트는 포함하지 마세요.
+
+    {history}
+
+    현재 질문: {input}
+
+    재작성된 질문:
+    """
+
+        # 질문 재정의 프롬프트 생성
+        rewrite_context = {
+            "history": formatted_history,
+            "input": request.chat.user,
+        }
+
+        rewrite_prompt = rewrite_prompt_template.format(**rewrite_context)
+
+        # vLLM에 질문 재정의 요청
+        rewrite_request = VllmInquery(
+            request_id=f"{session_id}_rewrite",
+            prompt=rewrite_prompt
+        )
+
+        logger.debug(f"[{session_id}] 질문 재정의 vLLM 요청 전송")
+        try:
+            # 질문 재정의 요청에 타임아웃 적용 (최대 3초)
+            rewrite_response = await asyncio.wait_for(
+                self.call_vllm_endpoint(rewrite_request),
+                timeout=3.0
+            )
+            rewritten_question = rewrite_response.get("generated_text", "").strip()
+
+            # 재작성된 질문이 없거나 오류 발생 시 원래 질문 사용
+            if not rewritten_question or len(rewritten_question) < 5:
+                logger.warning(f"[{session_id}] 질문 재정의 실패, 원래 질문 사용")
+                rewritten_question = request.chat.user
+            else:
+                logger.debug(f"[{session_id}] 질문 재정의 성공: '{rewritten_question}'")
+        except asyncio.TimeoutError:
+            logger.warning(f"[{session_id}] 질문 재정의 타임아웃, 원래 질문 사용")
+            rewritten_question = request.chat.user
+        except Exception as e:
+            logger.error(f"[{session_id}] 질문 재정의 오류: {str(e)}")
+            rewritten_question = request.chat.user
+
+        # 2단계: 재정의된 질문으로 문서 검색
+        logger.debug(f"[{session_id}] 재정의된 질문으로 문서 검색 시작")
+        try:
+            retrieval_document = await self.retriever.ainvoke(rewritten_question)
+            logger.debug(f"[{session_id}] 문서 검색 완료: {len(retrieval_document)}개 문서")
+        except Exception as e:
+            logger.error(f"[{session_id}] 문서 검색 중 오류: {str(e)}")
+            # 오류 발생 시 빈 문서 리스트
+            retrieval_document = []
+
+        # 3단계: 최종 스트리밍 응답 준비
+        # RAG 프롬프트 템플릿 가져오기
+        rag_prompt_template = self.response_generator.get_rag_qa_prompt(self.current_rag_sys_info)
+
+        # 최종 응답 생성을 위한 컨텍스트 준비
+        final_prompt_context = {
+            "input": request.chat.user,  # 원래 질문 사용
+            "rewritten_question": rewritten_question,  # 재작성된 질문도 제공
+            "history": formatted_history,  # 형식화된 대화 이력
+            "context": retrieval_document,  # 검색된 문서
+            "language": language,
+            "today": self.response_generator.get_today(),
+        }
+
+        # VOC 관련 설정 추가 (필요한 경우)
+        if self.request.meta.rag_sys_info == "komico_voc":
+            final_prompt_context.update({
+                "gw_doc_id_prefix_url": settings.voc.gw_doc_id_prefix_url,
+                "check_gw_word_link": settings.voc.check_gw_word_link,
+                "check_gw_word": settings.voc.check_gw_word,
+                "check_block_line": settings.voc.check_block_line,
+            })
+
+        # 개선된 시스템 프롬프트 빌드 함수 사용
+        try:
+            vllm_inquery_context = self.build_system_prompt_improved(rag_prompt_template, final_prompt_context)
+        except Exception as e:
+            logger.error(f"[{session_id}] 개선된 프롬프트 빌드 오류: {str(e)}")
+            # 오류 발생 시 기존 빌드 함수 사용
+            vllm_inquery_context = self.build_system_prompt(rag_prompt_template, final_prompt_context)
+
+        # 스트리밍을 위한 vLLM 요청 생성
+        vllm_request = VllmInquery(
+            request_id=session_id,
+            prompt=vllm_inquery_context,
+            stream=True  # 스트리밍 모드 활성화
+        )
+
+        logger.debug(f"[{session_id}] 스트리밍 요청 준비 완료")
+
+        # 성능 개선을 위한 통계 측정
+        self.response_stats = {
+            "rewrite_time": 0,
+            "retrieval_time": 0,
+            "total_prep_time": time.time()
+        }
 
         return vllm_request, retrieval_document
 
@@ -520,6 +808,55 @@ class LlmHistoryHandler:
             logger.error(f"Error formatting system prompt: {e}")
             # Fallback to basic prompt if formatting fails completely
             return f"Answer the following question based on the context: {context.get('input', 'No input provided')}"
+
+    @classmethod
+    def build_system_prompt_improved(cls, system_prompt_template, context):
+        """
+        개선된 시스템 프롬프트 빌드 메소드.
+        재작성된 질문을 포함하고 오류 처리를 강화했습니다.
+
+        Args:
+            system_prompt_template (str): 프롬프트 템플릿
+            context (dict): 템플릿에 적용할 변수들
+
+        Returns:
+            str: 형식화된 시스템 프롬프트
+        """
+        try:
+            # 템플릿에 재작성된 질문 주입을 위한 토큰 추가
+            if "rewritten_question" in context and "{rewritten_question}" not in system_prompt_template:
+                # 템플릿에 재작성된 질문 활용 지시문 추가
+                insert_point = system_prompt_template.find("{input}")
+                if insert_point > 0:
+                    instruction = "\n\n# 재작성된 질문\n다음은 대화 맥락을 고려하여 명확하게 재작성된 질문입니다. 응답 생성 시 참고하세요:\n{rewritten_question}\n\n# 원래 질문\n"
+                    system_prompt_template = system_prompt_template[
+                                             :insert_point] + instruction + system_prompt_template[insert_point:]
+
+            # 모든 필수 키가 있는지 확인
+            required_keys = set()
+            for match in re.finditer(r"{(\w+)}", system_prompt_template):
+                required_keys.add(match.group(1))
+
+            # 누락된 키가 있으면 빈 문자열로 대체
+            for key in required_keys:
+                if key not in context:
+                    logger.warning(f"시스템 프롬프트 템플릿에 필요한 키가 누락됨: {key}, 빈 문자열로 대체합니다.")
+                    context[key] = ""
+
+            # 템플릿 형식화
+            return system_prompt_template.format(**context)
+
+        except KeyError as e:
+            # 누락된 키 처리
+            missing_key = str(e).strip("'")
+            logger.warning(f"시스템 프롬프트 템플릿에 키가 누락됨: {missing_key}, 빈 문자열로 대체합니다.")
+            context[missing_key] = ""
+            return system_prompt_template.format(**context)
+        except Exception as e:
+            # 기타 예외 처리
+            logger.error(f"시스템 프롬프트 형식화 중 오류: {e}")
+            # 기본 프롬프트로 폴백
+            return f"다음 컨텍스트를 기반으로 질문에 답하세요:\n\n컨텍스트: {context.get('context', '')}\n\n질문: {context.get('input', '질문 없음')}"
 
     async def invoke_chain(self, rag_chain, common_input: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """

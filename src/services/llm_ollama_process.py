@@ -946,8 +946,6 @@ class LLMService:
             elif settings.llm.llm_backend.lower() == "vllm":
                 logger.debug(f"[{session_id}] Starting vLLM invocation")
                 vllm_inquery_context = self.build_system_prompt(context)
-                logger.error(context)
-                logger.error(documents)
 
                 vllm_request = VllmInquery(
                     request_id=session_id,
@@ -1342,8 +1340,10 @@ class ChatService:
     async def stream_chat(self, background_tasks: BackgroundTasks = None) -> StreamingResponse:
         """
         문자 단위 처리를 통한 실시간 스트리밍 응답 제공, 히스토리 지원 기능 추가
+        개선된 2단계 접근법으로 대화 이력을 처리
 
-        LlmHistoryHandler를 활용하여 대화 히스토리 처리
+        Returns:
+            StreamingResponse: 스트리밍 응답 객체
         """
         session_id = self.request.meta.session_id
         await self._log("info", f"[{session_id}] 문자 단위 스트리밍 채팅 요청 시작", session_id=session_id)
@@ -1377,23 +1377,13 @@ class ChatService:
                 return StreamingResponse(simple_stream(), media_type="text/event-stream")
 
             # 문서 검색 및 언어 설정 병렬 처리
-            retrieval_task = asyncio.create_task(self._retrieve_documents())
             language_task = asyncio.create_task(self._get_language_settings())
-
-            # 작업 완료 대기
-            await asyncio.gather(retrieval_task, language_task)
+            await language_task
 
             # 결과 수집
-            documents = retrieval_task.result()
             lang, trans_lang, reference_word = language_task.result()
-
-            elapsed = self._record_stage("parallel_processing")
-            await self._log(
-                "info",
-                f"[{session_id}] 병렬 처리 완료(준비): {elapsed:.4f}초 소요, "
-                f"{len(documents)} 문서 검색됨",
-                session_id=session_id
-            )
+            elapsed = self._record_stage("language_processing")
+            await self._log("info", f"[{session_id}] 언어 처리 완료: {elapsed:.4f}초 소요", session_id=session_id)
 
             # vLLM 백엔드 확인
             if settings.llm.llm_backend.lower() != "vllm":
@@ -1414,7 +1404,7 @@ class ChatService:
                 self.voc_processor,
                 self.search_engine,
                 self.request,
-                documents
+                []  # 빈 문서 리스트로 시작 (나중에 업데이트)
             )
 
             # vLLM 요청 준비
@@ -1424,24 +1414,44 @@ class ChatService:
             if settings.chat_history.enabled and hasattr(self, 'history_handler'):
                 await self._log("info", f"[{session_id}] 히스토리 기능이 활성화된 상태로 스트리밍 처리 진행", session_id=session_id)
 
+                # 개선된 히스토리 처리 사용 여부 확인
+                use_improved_history = getattr(settings.llm, 'use_improved_history', False)
+
                 # 히스토리 핸들러에 검색기 초기화
                 await self.history_handler.init_retriever(documents)
 
-                # 개선된 LlmHistoryHandler의 스트리밍 메서드 사용
-                vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_vllm_streaming(
-                    self.request, trans_lang
-                )
-                logger.info(vllm_request)
+                if use_improved_history:
+                    # 개선된 2단계 접근법 사용
+                    vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_vllm_streaming_improved(
+                        self.request, trans_lang
+                    )
+                else:
+                    # 기존 방식 사용
+                    vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_vllm_streaming(
+                        self.request, trans_lang
+                    )
+
+                logger.info(f"[{session_id}] vLLM 요청 준비 완료: {use_improved_history and '개선된 방식' or '기존 방식'}")
 
                 # 문서 업데이트
-                if retrieval_document and retrieval_document != documents:
-                    await self._log("debug", f"[{session_id}] 히스토리 검색 문서로 업데이트: {len(retrieval_document)}개",
+                if retrieval_document:
+                    await self._log("debug", f"[{session_id}] 검색된 문서로 업데이트: {len(retrieval_document)}개",
                                     session_id=session_id)
                     # 포스트 프로세서의 문서도 업데이트
                     post_processor.documents = retrieval_document
             else:
                 # 히스토리 없는 일반 스트리밍 처리
                 # 컨텍스트 준비
+                await self._log("info", f"[{session_id}] 히스토리 없는 일반 스트리밍 처리 시작", session_id=session_id)
+
+                # 문서 검색
+                retrieval_task = asyncio.create_task(self._retrieve_documents())
+                await retrieval_task
+                documents = retrieval_task.result()
+
+                # 포스트 프로세서 업데이트
+                post_processor.documents = documents
+
                 context = {
                     "input": self.request.chat.user,
                     "context": documents,
@@ -1764,14 +1774,21 @@ class ChatService:
                     # Process chat with history for vLLM
                     await self._log("debug", f"[{session_id}] Processing chat with history for vLLM backend")
 
-                    # 개선된 LlmHistoryHandler 메서드 사용
-                    chat_history_result = await self.history_handler.handle_chat_with_history_vllm(
-                        self.request, trans_lang
-                    )
+                    use_improved_history = getattr(settings.llm, 'use_improved_history', False)
 
-                    if chat_history_result:
-                        query_answer = chat_history_result[0]
-                        vllm_retrival_document = chat_history_result[1]
+                    if use_improved_history:
+                        result = await self.history_handler.handle_chat_with_history_vllm_improved(
+                            self.request, trans_lang
+                        )
+                    else:
+                        # 기존 방식 사용
+                        result = await self.history_handler.handle_chat_with_history_vllm(
+                            self.request, trans_lang
+                        )
+
+                    if result:
+                        query_answer = result[0]
+                        vllm_retrival_document = result[1]
                     else:
                         query_answer = ""
                         vllm_retrival_document = []

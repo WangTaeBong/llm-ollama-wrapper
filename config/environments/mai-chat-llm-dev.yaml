@@ -55,6 +55,10 @@ LLM_MODEL:
 LLM:
   llm_backend: "vllm"
   steaming_enabled: true
+  use_improved_history: true  # 개선된 히스토리 처리 사용
+  max_history_turns: 5        # 최대 히스토리 턴 수
+  query_rewrite: true         # 질문 재정의 기능 사용
+  rewrite_timeout: 3.0        # 질문 재정의 최대 대기 시간(초)
 
 VLLM:
   endpoint_url: "http://10.50.1.43:8020/generate"
@@ -91,7 +95,7 @@ LM_CHECK:
 PROMPT:
   faq_type: "komico_faq_it,komico_faq_lab"
   source_priority: false
-  source_type: "mico_hr_it"
+  source_type: "mico_hr_it,aicess_hr,aicess_m"
   none_source_type: "komico_faq_it,komico_faq_lab,komico_voc"
   source_count: 2
   json_config_path: "C:/Projects/01.Python/MAI-CHAT-PROD/llm-ollama-wrapper/config/prompts"
@@ -108,13 +112,13 @@ VOC:
   gw_doc_id_link_correct_pattern: "https://intermico.com/app/approval/document(?:\/\\d{8})"
 
 WEB_SEARCH:
-  use_flag: false
+  use_flag: true
   document_add_type: 1
   region: "kr-kr"
   max_results: 5
 
 CHAT_HISTORY:
-  enabled: false
+  enabled: true
 
 REDIS:
   host: "10.50.1.26"
@@ -123,7 +127,8 @@ REDIS:
   database: 0
   ttl_enabled: true
   ttl_time: 1800
-  get_message_count: 20
+  get_message_count: 10
+  max_turns: 10
 
 CACHE:
   max_size: 200
