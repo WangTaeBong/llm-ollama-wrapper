@@ -572,16 +572,21 @@ class LLMService:
         Returns:
             bool: Gemma 모델이면 True, 아니면 False
         """
-        # OLLAMA 설정에서 모델 이름 확인
-        if hasattr(settings, 'ollama') and hasattr(settings.ollama, 'model_name'):
-            model_name = settings.ollama.model_name.lower()
-            return 'gemma' in model_name
+        # LLM 백엔드 확인
+        backend = getattr(settings.llm, 'llm_backend', '').lower()
 
-        # VLLM 설정에서 model_type 확인
-        if hasattr(settings, 'llm') and hasattr(settings.llm, 'model_type'):
-            model_type = settings.llm.model_type.lower() if hasattr(settings.llm.model_type, 'lower') else str(
-                settings.llm.model_type).lower()
-            return model_type == 'gemma'
+        # OLLAMA 백엔드인 경우
+        if backend == 'ollama':
+            if hasattr(settings.ollama, 'model_name'):
+                model_name = settings.ollama.model_name.lower()
+                return 'gemma' in model_name
+
+        # VLLM 백엔드인 경우
+        elif backend == 'vllm':
+            if hasattr(settings.llm, 'model_type'):
+                model_type = settings.llm.model_type.lower() if hasattr(settings.llm.model_type, 'lower') else str(
+                    settings.llm.model_type).lower()
+                return model_type == 'gemma'
 
         # 기본적으로 False 반환
         return False
@@ -1173,6 +1178,33 @@ class ChatService:
             logger.info("Asynchronous logging system initialized")
 
     @classmethod
+    def is_gemma_model(cls) -> bool:
+        """
+        현재 모델이 Gemma 모델인지 확인합니다.
+
+        Returns:
+            bool: Gemma 모델이면 True, 아니면 False
+        """
+        # LLM 백엔드 확인
+        backend = getattr(settings.llm, 'llm_backend', '').lower()
+
+        # OLLAMA 백엔드인 경우
+        if backend == 'ollama':
+            if hasattr(settings.ollama, 'model_name'):
+                model_name = settings.ollama.model_name.lower()
+                return 'gemma' in model_name
+
+        # VLLM 백엔드인 경우
+        elif backend == 'vllm':
+            if hasattr(settings.llm, 'model_type'):
+                model_type = settings.llm.model_type.lower() if hasattr(settings.llm.model_type, 'lower') else str(
+                    settings.llm.model_type).lower()
+                return model_type == 'gemma'
+
+        # 기본적으로 False 반환
+        return False
+
+    @classmethod
     def is_log_initialized(cls):
         """
         Check if the logging system is initialized.
@@ -1498,16 +1530,42 @@ class ChatService:
                 # 히스토리 핸들러에 검색기 초기화
                 await self.history_handler.init_retriever(empty_documents)
 
-                if use_improved_history:
-                    # 개선된 2단계 접근법 사용
-                    vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_vllm_streaming_improved(
+                # 모델 유형에 따른 스트리밍 핸들러 디스패치
+                if self.__class__.is_gemma_model():
+                    logger.error("11111111")
+                    logger.info(f"[{session_id}] Gemma 모델 감지됨, Gemma 스트리밍 핸들러로 처리")
+                    vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_gemma_streaming(
                         self.request, trans_lang
                     )
                 else:
-                    # 기존 방식 사용
-                    vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_vllm_streaming(
-                        self.request, trans_lang
-                    )
+                    # 기존 모델을 위한 처리
+                    if settings.llm.steaming_enabled and settings.llm.llm_backend.lower() == "vllm":
+                        logger.error("2222222")
+                        # 개선된 히스토리 처리 기능 확인
+                        if getattr(settings.llm, 'use_improved_history', False):
+                            logger.error("3333333")
+                            # 개선된 2단계 접근법 사용
+                            vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_vllm_streaming_improved(
+                                self.request, trans_lang
+                            )
+                        else:
+                            logger.error("44444444")
+                            # 기존 방식 사용
+                            vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_vllm_streaming(
+                                self.request, trans_lang
+                            )
+                    else:
+                        # 스트리밍이 지원되지 않거나 vLLM이 아닌 경우
+                        logger.error(f"[{session_id}] 스트리밍은 vLLM 백엔드에서만 지원됩니다.")
+
+                        # 오류 스트림 생성
+                        async def error_stream():
+                            error_msg = "스트리밍은 vLLM 백엔드에서만 지원됩니다."
+                            error_data = {'error': True, 'text': error_msg, 'finished': True}
+                            json_str = json.dumps(error_data, ensure_ascii=False)
+                            yield f"data: {json_str}\n\n"
+
+                        return StreamingResponse(error_stream(), media_type="text/event-stream")
 
                 logger.info(f"[{session_id}] vLLM 요청 준비 완료: {use_improved_history and '개선된 방식' or '기존 방식'}")
 
