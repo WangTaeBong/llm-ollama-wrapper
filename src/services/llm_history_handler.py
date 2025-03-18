@@ -982,6 +982,13 @@ class LlmHistoryHandler:
             stream=True  # 스트리밍 모드 활성화
         )
 
+        logger.debug(
+            f"[{session_id}] 스트리밍 요청 준비 완료 - "
+            f"원본 질문: '{request.chat.user}', "
+            f"재작성된 질문: '{rewritten_question}', "
+            f"검색된 문서 수: {len(retrieval_document)}"
+        )
+
         logger.debug(f"[{session_id}] 스트리밍 요청 준비 완료")
 
         # 성능 개선을 위한 통계 측정
@@ -1229,6 +1236,7 @@ class LlmHistoryHandler:
 
         # 최종 시스템 프롬프트 생성 (Gemma 형식)
         vllm_inquery_context = self.build_system_prompt_gemma(rag_prompt_template, final_prompt_context)
+        logger.debug(f"[{session_id}] Gemma prompt: {vllm_inquery_context}")
 
         # 스트리밍을 위한 vLLM 요청 생성
         vllm_request = VllmInquery(
@@ -1238,6 +1246,13 @@ class LlmHistoryHandler:
         )
 
         logger.debug(f"[{session_id}] Gemma 스트리밍 요청 준비 완료")
+
+        logger.debug(
+            f"[{session_id}] 스트리밍 요청 준비 완료 - "
+            f"원본 질문: '{request.chat.user}', "
+            f"재작성된 질문: '{rewritten_question}', "
+            f"검색된 문서 수: {len(retrieval_document)}"
+        )
 
         # 성능 개선을 위한 통계 측정
         self.response_stats = {
