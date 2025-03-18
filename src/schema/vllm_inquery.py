@@ -68,7 +68,7 @@ class VllmInquery(BaseModel):
         Returns:
             int: Number of characters in the inquiry text
         """
-        return len(self.vllm_inquery)
+        return len(self.prompt)
 
     def get_truncated_inquery(self, max_length: int = 50) -> str:
         """
@@ -81,10 +81,10 @@ class VllmInquery(BaseModel):
         Returns:
             str: Truncated inquiry text with ellipsis if necessary
         """
-        if len(self.vllm_inquery) <= max_length:
-            return self.vllm_inquery
+        if len(self.prompt) <= max_length:
+            return self.prompt
 
-        return f"{self.vllm_inquery[:max_length]}..."
+        return f"{self.prompt[:max_length]}..."
 
     def to_log_string(self) -> str:
         """
@@ -94,4 +94,4 @@ class VllmInquery(BaseModel):
             str: Formatted string containing session ID and truncated inquiry
         """
         truncated = self.get_truncated_inquery()
-        return f"Session[{self.session_id}]: {truncated}"
+        return f"Session[{self.request_id}]: {truncated}"

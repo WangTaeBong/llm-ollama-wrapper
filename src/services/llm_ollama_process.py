@@ -1398,13 +1398,14 @@ class ChatService:
 
                 return StreamingResponse(error_stream(), media_type="text/event-stream")
 
-            # 문자 단위 처리 프로세서 초기화
+            # 문자 단위 처리 프로세서 초기화 (빈 문서 리스트로 시작)
+            empty_documents = []  # 명시적으로 빈 문서 리스트 생성
             post_processor = StreamResponsePostProcessor(
                 self.response_generator,
                 self.voc_processor,
                 self.search_engine,
                 self.request,
-                []  # 빈 문서 리스트로 시작 (나중에 업데이트)
+                empty_documents  # 빈 문서 리스트로 시작 (나중에 업데이트)
             )
 
             # vLLM 요청 준비
@@ -1418,7 +1419,7 @@ class ChatService:
                 use_improved_history = getattr(settings.llm, 'use_improved_history', False)
 
                 # 히스토리 핸들러에 검색기 초기화
-                await self.history_handler.init_retriever(documents)
+                await self.history_handler.init_retriever(empty_documents)
 
                 if use_improved_history:
                     # 개선된 2단계 접근법 사용

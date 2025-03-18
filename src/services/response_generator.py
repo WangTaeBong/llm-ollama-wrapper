@@ -139,6 +139,20 @@ class ResponseGenerator:
         faq_targets = self._get_cached_setting('faq_category_rag_target_list')
         return current_rag_sys_info in faq_targets
 
+    def is_voc_type_chatbot(self, current_rag_sys_info: str) -> bool:
+        """
+        Checks if the current RAG system information is of VOC type.
+
+        Args:
+            current_rag_sys_info (str): Current RAG system information
+
+        Returns:
+            bool: True if it's a VOC type, False otherwise
+        """
+        # VOC 타입 검사
+        voc_types = self.settings.voc.voc_type.split(',')
+        return current_rag_sys_info in voc_types
+
     @lru_cache(maxsize=64)
     def get_rag_qa_prompt(self, rag_sys_info: str) -> str:
         """
@@ -233,7 +247,7 @@ class ResponseGenerator:
 
         try:
             # Collect deduplicated document source information
-            docs_source: Dict[str, str] = {}
+            docs_source: Dict[str, Dict[str, any]] = {}
             for doc in retriever_documents:
                 # Extract document name and page
                 doc_name = doc.metadata.get("doc_name") or doc.metadata.get("source", "Unknown Document")
@@ -242,13 +256,34 @@ class ResponseGenerator:
 
                 doc_page = doc.metadata.get("doc_page", "N/A")
 
+                # Determine if this is a web search result
+                is_web_result = False
+                if isinstance(doc_page, str) and (doc_page.startswith("http://") or doc_page.startswith("https://")):
+                    is_web_result = True
+                elif isinstance(doc_name, str) and (doc_name.startswith("http://") or doc_name.startswith("https://")):
+                    is_web_result = True
+                    # If the doc_name is a URL, use it as doc_page and create a cleaner doc_name
+                    if doc_page == "N/A":
+                        doc_page = doc_name
+                        # Extract a cleaner name from the URL
+                        try:
+                            from urllib.parse import urlparse
+                            parsed_url = urlparse(doc_name)
+                            doc_name = parsed_url.netloc
+                        except:
+                            # Fallback if parsing fails
+                            doc_name = "Web Source"
+
                 # Remove leading '/' from path
                 if isinstance(doc_name, str) and doc_name.startswith('/'):
                     doc_name = doc_name[1:]
 
                 # Remove duplicate sources (reference each document only once)
                 if doc_name not in docs_source:
-                    docs_source[doc_name] = doc_page
+                    docs_source[doc_name] = {
+                        "page": doc_page,
+                        "is_web": is_web_result
+                    }
 
             # Add reference information
             if docs_source:
@@ -258,19 +293,55 @@ class ResponseGenerator:
                     len(docs_source)
                 )
 
+                # Separate web results and RAG results
+                web_results = []
+                rag_results = []
+
+                for doc_name, data in docs_source.items():
+                    if data["is_web"]:
+                        web_results.append((doc_name, data["page"]))
+                    else:
+                        rag_results.append((doc_name, data["page"]))
+
                 # Create reference section
                 reference_section = f"\n\n---------\n{reference_word}"
-                for i, (doc_name, doc_page) in enumerate(docs_source.items()):
+
+                # Add RAG results first
+                for i, (doc_name, doc_page) in enumerate(rag_results):
                     if i >= max_sources:
                         break
                     reference_section += f"\n- {doc_name} (Page: {doc_page})"
 
+                # Add Web results with "Link" word that has hyperlink
+                web_search_enabled = hasattr(self.settings, 'web_search') and getattr(self.settings.web_search,
+                                                                                      'use_flag', False)
+                if web_search_enabled:
+                    for i, (doc_name, url) in enumerate(web_results):
+                        if i >= max_sources:
+                            break
+                        # Check if we're dealing with a valid URL
+                        if url and (url.startswith("http://") or url.startswith("https://")):
+                            # Directly create the HTML link without markers
+                            reference_section += f"\n- {doc_name} (<a href=\"{url}\" target=\"_blank\">Link</a>)"
+                        else:
+                            # Fallback for invalid URLs
+                            reference_section += f"\n- {doc_name} (Link: {url})"
+                else:
+                    # If web search is disabled, still show the results
+                    for i, (doc_name, url) in enumerate(web_results):
+                        if i >= max_sources:
+                            break
+                        reference_section += f"\n- {doc_name} (URL: {url})"
+
                 # Add reference section to original answer
                 query_answer += reference_section
 
+                # HTML 링크는 이미 직접 삽입되었으므로 추가 처리가 필요하지 않음
+
                 # Log important information
                 if len(docs_source) > 0:
-                    log_with_session_id(logger.debug, f"{len(docs_source)} reference documents added to the answer",
+                    log_with_session_id(logger.debug,
+                                        f"{len(docs_source)} reference documents ({len(web_results)} web, {len(rag_results)} RAG) added to the answer",
                                         request)
 
             return query_answer

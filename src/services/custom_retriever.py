@@ -332,7 +332,8 @@ class WebSearchProvider:
         """
         # Return empty list if web search is disabled or for FAQ chatbots
         if (not self.settings.web_search.use_flag or
-                (rag_sys_info and self.response_generator.is_faq_type_chatbot(rag_sys_info))):
+                (rag_sys_info and self.response_generator.is_faq_type_chatbot(rag_sys_info)) or
+                self.response_generator.is_voc_type_chatbot(rag_sys_info)):
             return []
 
         # Create cache key
@@ -608,30 +609,51 @@ class CustomRetriever(BaseRetriever, BaseModel):
                 if self.query_callback:
                     self.query_callback(query)
 
-                # Run multiple search tasks in parallel
-                tasks = [
-                    self._api_client.fetch_documents(self.request_data, query),
-                    self._web_search.search_async(query, self.request_data.meta.rag_sys_info, session_id)
-                ]
+                # 웹 검색 설정 확인
+                web_search_enabled = getattr(settings.web_search, 'use_flag', False)
+                document_add_type = getattr(settings.web_search, 'document_add_type', 1)
 
-                # Execute all tasks in parallel and wait for results
+                # 작업 목록 초기화
+                tasks = []
+                task_types = []
+
+                # web_search.use_flag가 true이고 document_add_type이 0이면 API 문서 검색을 건너뜀
+                if not (web_search_enabled and document_add_type == 0):
+                    # API 문서 검색 작업 추가
+                    tasks.append(self._api_client.fetch_documents(self.request_data, query))
+                    task_types.append("api")
+                    logger.debug(f"[{session_id}] API 문서 검색 작업 추가됨")
+                else:
+                    logger.debug(
+                        f"[{session_id}] 웹 검색 설정에 따라 API 문서 검색을 건너뜁니다 (use_flag={web_search_enabled}, document_add_type={document_add_type})")
+
+                # 웹 검색이 활성화된 경우 웹 검색 작업 추가
+                if web_search_enabled:
+                    tasks.append(self._web_search.search_async(query, self.request_data.meta.rag_sys_info, session_id))
+                    task_types.append("web")
+                    logger.debug(f"[{session_id}] 웹 검색 작업 추가됨")
+
+                # 모든 작업 동시 실행
                 results = await asyncio.gather(*tasks)
 
-                # Unpack results (results are returned in the order of tasks)
-                api_response = results[0]
-                web_results = results[1]
+                # 결과 처리
+                rag_documents = []
 
-                # Process response
-                rag_documents = self._extract_documents_from_response(api_response, session_id)
-
-                # Integrate web search results
-                if web_results:
-                    if settings.web_search.document_add_type == 1:
-                        # Add web search results to existing documents
-                        rag_documents.extend(web_results)
-                    elif settings.web_search.document_add_type == 0:
-                        # Return only web search results
-                        return web_results
+                # 작업 유형에 따라 결과 처리
+                for i, task_type in enumerate(task_types):
+                    if task_type == "api":
+                        api_response = results[i]
+                        rag_documents = self._extract_documents_from_response(api_response, session_id)
+                    elif task_type == "web" and results[i]:
+                        web_results = results[i]
+                        # 웹 검색 결과 통합 방식 결정
+                        if web_search_enabled:
+                            if document_add_type == 1 and rag_documents:
+                                # 기존 문서에 웹 검색 결과 추가
+                                rag_documents.extend(web_results)
+                            elif document_add_type == 0:
+                                # 웹 검색 결과만 반환
+                                rag_documents = web_results
 
                 total_time = time.time() - start_time
                 logger.debug(

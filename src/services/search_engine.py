@@ -140,7 +140,7 @@ class SearchEngine:
 
     def replace_urls_with_links(self, query_answer: str) -> str:
         """
-        Replaces URLs in text with hyperlinks.
+        Replaces URLs in text with hyperlinks, skipping already processed reference sections.
 
         Args:
             query_answer (str): Original text that may contain URLs
@@ -152,14 +152,40 @@ class SearchEngine:
             return ""
 
         try:
-            # Find URLs using the compiled regex
-            matches = self._url_pattern.findall(query_answer)
+            # Check if there's a reference section
+            reference_markers = ["[참고문헌]", "[References]", "[参考文献]"]
+            reference_section_start = -1
+
+            for marker in reference_markers:
+                pos = query_answer.find(marker)
+                if pos != -1:
+                    reference_section_start = pos
+                    break
+
+            # If no reference section, process the entire text
+            if reference_section_start == -1:
+                # Find URLs using the compiled regex
+                matches = self._url_pattern.findall(query_answer)
+
+                # Replace each discovered URL with a hyperlink
+                for url in matches:
+                    query_answer = query_answer.replace(url, f'<a href="{url}" target="_blank">{url}</a>')
+
+                return query_answer
+
+            # Split the text into main content and reference section
+            main_content = query_answer[:reference_section_start]
+            reference_section = query_answer[reference_section_start:]
+
+            # Only process URLs in the main content
+            matches = self._url_pattern.findall(main_content)
 
             # Replace each discovered URL with a hyperlink
             for url in matches:
-                query_answer = query_answer.replace(url, f'<a href="{url}" target="_blank">{url}</a>')
+                main_content = main_content.replace(url, f'<a href="{url}" target="_blank">{url}</a>')
 
-            return query_answer
+            # Combine main content and reference section
+            return main_content + reference_section
 
         except Exception as e:
             logger.error(f"Error converting URLs to hyperlinks: {str(e)}")

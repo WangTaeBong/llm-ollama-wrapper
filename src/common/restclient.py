@@ -383,9 +383,14 @@ class RestClient:
         )
 
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            # 중요: ClientSession 생성 시 명시적으로 close_timeout을 길게 설정
+            async with aiohttp.ClientSession(timeout=timeout,
+                                             connector=aiohttp.TCPConnector(force_close=False),
+                                             raise_for_status=True) as session:
                 # Convert request data to JSON
                 request_data = data.dict() if hasattr(data, "dict") else data
+
+                logger.debug(f"[{session_id}] Sending streaming request to {url}")
 
                 # Measure connection setup time
                 connection_start = time.time()

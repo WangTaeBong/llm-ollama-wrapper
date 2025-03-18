@@ -1,4 +1,7 @@
+import asyncio
 import logging
+import re
+import time
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -52,6 +55,7 @@ class LlmHistoryHandler:
             request (ChatRequest): The chat request containing metadata and user input.
             max_history_turns (int): Maximum number of conversation turns to maintain.
         """
+        self.response_stats = None
         self.llm_model = llm_model
         self.current_session_id = request.meta.session_id
         self.current_rag_sys_info = request.meta.rag_sys_info
@@ -284,66 +288,95 @@ class LlmHistoryHandler:
     @classmethod
     def format_history_for_prompt(cls, session_history: ChatMessageHistory, max_turns: int = 5) -> str:
         """
-        Format chat history for prompt in a clean, structured format.
+        형식화된 대화 이력을 생성합니다.
+        이전 대화의 맥락을 효과적으로 포착하기 위한 개선된 형식을 사용합니다.
 
         Args:
-            session_history: The chat message history
+            session_history: 채팅 메시지 이력
             max_turns: 포함할 최대 대화 턴 수 (기본값: 5)
 
         Returns:
-            Formatted history string
+            형식화된 대화 이력 문자열
         """
-        if not session_history.messages:
-            return ""
+        try:
+            # 파라미터 유효성 검사
+            if not session_history or not hasattr(session_history, 'messages'):
+                logger.warning("유효하지 않은 session_history 객체가 제공되었습니다.")
+                return ""
+
+            messages = session_history.messages
+            if not messages:
+                return ""
 
             # 가장 최근 대화부터 max_turns 수만큼만 추출
-        messages = session_history.messages
-        if len(messages) > max_turns * 2:  # 각 턴은 사용자 메시지와 시스템 응답을 포함
-            messages = messages[-(max_turns * 2):]
+            if len(messages) > max_turns * 2:  # 각 턴은 사용자 메시지와 시스템 응답을 포함
+                messages = messages[-(max_turns * 2):]
 
-        formatted_history = []
+            formatted_history = []
 
-        # 대화 이력 프롬프트 헤더 추가
-        formatted_history.append("# 이전 대화 내용")
+            # 대화 이력 프롬프트 헤더 추가
+            formatted_history.append("# 이전 대화 내용")
 
-        # 대화 턴 구성
-        turns = []
-        current_turn = {"user": None, "assistant": None}
+            # 대화 턴 구성
+            turns = []
+            current_turn = {"user": None, "assistant": None}
 
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                # 이전 턴이 있으면 저장
-                if current_turn["user"] is not None and current_turn["assistant"] is not None:
-                    turns.append(current_turn)
-                    current_turn = {"user": None, "assistant": None}
+            for msg in messages:
+                # 타입 검사 추가
+                if hasattr(msg, '__class__') and hasattr(msg.__class__, '__name__'):
+                    msg_type = msg.__class__.__name__
+                else:
+                    msg_type = str(type(msg))
 
-                # 현재 사용자 메시지 저장
-                current_turn["user"] = msg.content
-            elif isinstance(msg, AIMessage):
-                current_turn["assistant"] = msg.content
+                # HumanMessage 처리
+                if isinstance(msg, HumanMessage) or "HumanMessage" in msg_type:
+                    # 이전 턴이 있으면 저장
+                    if current_turn["user"] is not None and current_turn["assistant"] is not None:
+                        turns.append(current_turn)
+                        current_turn = {"user": None, "assistant": None}
 
-        # 마지막 턴 저장
-        if current_turn["user"] is not None:
-            turns.append(current_turn)
+                    # 현재 사용자 메시지 저장
+                    if hasattr(msg, 'content'):
+                        current_turn["user"] = msg.content
+                    else:
+                        # content 속성이 없는 경우 문자열 변환 시도
+                        current_turn["user"] = str(msg)
 
-        # 턴 수가 많으면 가장 최근 턴 유지
-        if len(turns) > max_turns:
-            turns = turns[-max_turns:]
+                # AIMessage 처리
+                elif isinstance(msg, AIMessage) or "AIMessage" in msg_type:
+                    if hasattr(msg, 'content'):
+                        current_turn["assistant"] = msg.content
+                    else:
+                        # content 속성이 없는 경우 문자열 변환 시도
+                        current_turn["assistant"] = str(msg)
 
-        # 형식화된 대화 이력 생성
-        for i, turn in enumerate(turns):
-            formatted_history.append(f"\n## 대화 {i + 1}")
+            # 마지막 턴 저장
+            if current_turn["user"] is not None:
+                turns.append(current_turn)
 
-            if turn["user"]:
-                formatted_history.append(f"User: {turn['user']}")
+            # 턴 수가 많으면 가장 최근 턴 유지
+            if len(turns) > max_turns:
+                turns = turns[-max_turns:]
 
-            if turn["assistant"]:
-                formatted_history.append(f"Assistant: {turn['assistant']}")
+            # 형식화된 대화 이력 생성
+            for i, turn in enumerate(turns):
+                formatted_history.append(f"\n## 대화 {i + 1}")
 
-        # 개선된 프롬프트 지시문 추가
-        formatted_history.append("\n# 현재 질문에 답변할 때 위 대화 내용을 참고하세요.")
+                if turn["user"]:
+                    formatted_history.append(f"User: {turn['user']}")
 
-        return "\n".join(formatted_history)
+                if turn["assistant"]:
+                    formatted_history.append(f"Assistant: {turn['assistant']}")
+
+            # 개선된 프롬프트 지시문 추가
+            formatted_history.append("\n# 현재 질문에 답변할 때 위 대화 내용을 참고하세요.")
+
+            return "\n".join(formatted_history)
+
+        except Exception as e:
+            # 예외 발생 시 로깅하고 빈 문자열 반환
+            logger.error(f"대화 이력 형식화 중 오류 발생: {str(e)}")
+            return ""
 
     async def handle_chat_with_history(self,
                                        request: ChatRequest,
@@ -683,9 +716,10 @@ class LlmHistoryHandler:
         logger.debug(f"[{session_id}] 질문 재정의 vLLM 요청 전송")
         try:
             # 질문 재정의 요청에 타임아웃 적용 (최대 3초)
+            rewrite_timeout = getattr(settings.llm, 'rewrite_timeout', 3.0)
             rewrite_response = await asyncio.wait_for(
                 self.call_vllm_endpoint(rewrite_request),
-                timeout=3.0
+                timeout=rewrite_timeout
             )
             rewritten_question = rewrite_response.get("generated_text", "").strip()
 
@@ -704,13 +738,17 @@ class LlmHistoryHandler:
 
         # 2단계: 재정의된 질문으로 문서 검색
         logger.debug(f"[{session_id}] 재정의된 질문으로 문서 검색 시작")
+        retrieval_document = []  # 기본값으로 빈 리스트 설정
+
         try:
-            retrieval_document = await self.retriever.ainvoke(rewritten_question)
-            logger.debug(f"[{session_id}] 문서 검색 완료: {len(retrieval_document)}개 문서")
+            # 검색기가 초기화되어 있는지 확인 (오류 방지)
+            if self.retriever is not None:
+                retrieval_document = await self.retriever.ainvoke(rewritten_question)
+                logger.debug(f"[{session_id}] 문서 검색 완료: {len(retrieval_document)}개 문서")
+            else:
+                logger.warning(f"[{session_id}] 검색기가 초기화되지 않았습니다. 빈 문서 리스트 사용")
         except Exception as e:
             logger.error(f"[{session_id}] 문서 검색 중 오류: {str(e)}")
-            # 오류 발생 시 빈 문서 리스트
-            retrieval_document = []
 
         # 3단계: 최종 스트리밍 응답 준비
         # RAG 프롬프트 템플릿 가져오기
@@ -727,7 +765,7 @@ class LlmHistoryHandler:
         }
 
         # VOC 관련 설정 추가 (필요한 경우)
-        if self.request.meta.rag_sys_info == "komico_voc":
+        if request.meta.rag_sys_info == "komico_voc":
             final_prompt_context.update({
                 "gw_doc_id_prefix_url": settings.voc.gw_doc_id_prefix_url,
                 "check_gw_word_link": settings.voc.check_gw_word_link,
@@ -737,10 +775,39 @@ class LlmHistoryHandler:
 
         # 개선된 시스템 프롬프트 빌드 함수 사용
         try:
-            vllm_inquery_context = self.build_system_prompt_improved(rag_prompt_template, final_prompt_context)
+            # 일단 build_system_prompt_improved 함수가 있는지 확인
+            if hasattr(self, 'build_system_prompt_improved') and callable(
+                    getattr(self, 'build_system_prompt_improved')):
+                vllm_inquery_context = self.build_system_prompt_improved(rag_prompt_template, final_prompt_context)
+            else:
+                # 없으면 기존 함수 사용
+                import re
+                # build_system_prompt_improved를 인라인으로 구현
+                # 템플릿에 재작성된 질문 주입을 위한 토큰 추가
+                if "rewritten_question" in final_prompt_context and "{rewritten_question}" not in rag_prompt_template:
+                    # 템플릿에 재작성된 질문 활용 지시문 추가
+                    insert_point = rag_prompt_template.find("{input}")
+                    if insert_point > 0:
+                        instruction = "\n\n# 재작성된 질문\n다음은 대화 맥락을 고려하여 명확하게 재작성된 질문입니다. 응답 생성 시 참고하세요:\n{rewritten_question}\n\n# 원래 질문\n"
+                        rag_prompt_template = rag_prompt_template[:insert_point] + instruction + rag_prompt_template[
+                                                                                                 insert_point:]
+
+                # 모든 필수 키가 있는지 확인
+                required_keys = set()
+                for match in re.finditer(r"{(\w+)}", rag_prompt_template):
+                    required_keys.add(match.group(1))
+
+                # 누락된 키가 있으면 빈 문자열로 대체
+                for key in required_keys:
+                    if key not in final_prompt_context:
+                        logger.warning(f"시스템 프롬프트 템플릿에 필요한 키가 누락됨: {key}, 빈 문자열로 대체합니다.")
+                        final_prompt_context[key] = ""
+
+                # 템플릿 형식화
+                vllm_inquery_context = rag_prompt_template.format(**final_prompt_context)
         except Exception as e:
-            logger.error(f"[{session_id}] 개선된 프롬프트 빌드 오류: {str(e)}")
-            # 오류 발생 시 기존 빌드 함수 사용
+            logger.error(f"[{session_id}] 프롬프트 빌드 오류: {str(e)}")
+            # 오류 발생 시 기본 방식으로 폴백
             vllm_inquery_context = self.build_system_prompt(rag_prompt_template, final_prompt_context)
 
         # 스트리밍을 위한 vLLM 요청 생성
