@@ -70,6 +70,69 @@ class LlmHistoryHandler:
         query_check_dict = QueryCheckDict(settings.prompt.llm_prompt_path)
         self.response_generator = ResponseGenerator(settings, query_check_dict)
 
+    @classmethod
+    def is_gemma_model(cls) -> bool:
+        """
+        현재 모델이 Gemma 모델인지 확인합니다.
+
+        Returns:
+            bool: Gemma 모델이면 True, 아니면 False
+        """
+        # OLLAMA 설정에서 모델 이름 확인
+        if hasattr(settings, 'ollama') and hasattr(settings.ollama, 'model_name'):
+            model_name = settings.ollama.model_name.lower()
+            return 'gemma' in model_name
+
+        # VLLM 설정에서 model_type 확인
+        if hasattr(settings, 'llm') and hasattr(settings.llm, 'model_type'):
+            model_type = settings.llm.model_type.lower() if hasattr(settings.llm.model_type, 'lower') else str(
+                settings.llm.model_type).lower()
+            return model_type == 'gemma'
+
+        # 기본적으로 False 반환
+        return False
+
+    @classmethod
+    def build_system_prompt_gemma(cls, system_prompt_template, context):
+        """
+        Gemma에 맞는 형식으로 시스템 프롬프트를 구성합니다.
+
+        Args:
+            system_prompt_template (str): 프롬프트 템플릿
+            context (dict): 템플릿에 적용할 변수들
+
+        Returns:
+            str: Gemma 형식의 시스템 프롬프트
+        """
+        try:
+            # 먼저 기존 format 메서드로 변수를 대체
+            raw_prompt = system_prompt_template.format(**context)
+
+            # Gemma 형식으로 변환
+            # <start_of_turn>user 형식으로 시작
+            formatted_prompt = "<start_of_turn>user\n"
+
+            # 시스템 프롬프트 삽입
+            formatted_prompt += raw_prompt
+
+            # 사용자 입력부 종료 및 모델 응답 시작
+            formatted_prompt += "\n<end_of_turn>\n<start_of_turn>model\n"
+
+            return formatted_prompt
+
+        except KeyError as e:
+            # 누락된 키 처리
+            missing_key = str(e).strip("'")
+            logger.warning(f"시스템 프롬프트 템플릿에 키가 누락됨: {missing_key}, 빈 문자열로 대체합니다.")
+            context[missing_key] = ""
+            return cls.build_system_prompt_gemma(system_prompt_template, context)
+        except Exception as e:
+            # 기타 예외 처리
+            logger.error(f"Gemma 시스템 프롬프트 형식화 중 오류: {e}")
+            # 기본 Gemma 프롬프트로 폴백
+            basic_prompt = f"<start_of_turn>user\n다음 질문에 답해주세요: {context.get('input', '질문 없음')}\n<end_of_turn>\n<start_of_turn>model\n"
+            return basic_prompt
+
     async def init_retriever(self, retrieval_documents: List[Document]) -> CustomRetriever:
         """
         Initialize and return a custom retriever.
@@ -378,6 +441,56 @@ class LlmHistoryHandler:
             logger.error(f"대화 이력 형식화 중 오류 발생: {str(e)}")
             return ""
 
+    @classmethod
+    def format_history_for_gemma(cls, session_history: ChatMessageHistory, max_turns: int = 5) -> str:
+        """
+        Gemma 모델에 적합한 형식으로 대화 이력을 구성합니다.
+        Gemma의 <start_of_turn>user/<start_of_turn>model 형식을 사용합니다.
+
+        Args:
+            session_history: 채팅 메시지 이력
+            max_turns: 포함할 최대 대화 턴 수 (기본값: 5)
+
+        Returns:
+            str: Gemma 형식의 대화 이력 문자열
+        """
+        try:
+            # 파라미터 유효성 검사
+            if not session_history or not hasattr(session_history, 'messages'):
+                logger.warning("유효하지 않은 session_history 객체가 제공되었습니다.")
+                return ""
+
+            messages = session_history.messages
+            if not messages:
+                return ""
+
+            # 가장 최근 대화부터 max_turns 수만큼만 추출
+            if len(messages) > max_turns * 2:  # 각 턴은 사용자 메시지와 시스템 응답을 포함
+                messages = messages[-(max_turns * 2):]
+
+            formatted_history = []
+
+            # 대화 턴 구성
+            for i in range(0, len(messages), 2):
+                # 사용자 메시지
+                if i < len(messages):
+                    user_msg = messages[i]
+                    if hasattr(user_msg, 'content'):
+                        formatted_history.append(f"<start_of_turn>user\n{user_msg.content}<end_of_turn>")
+
+                # 시스템 메시지
+                if i + 1 < len(messages):
+                    sys_msg = messages[i + 1]
+                    if hasattr(sys_msg, 'content'):
+                        formatted_history.append(f"<start_of_turn>model\n{sys_msg.content}<end_of_turn>")
+
+            return "\n".join(formatted_history)
+
+        except Exception as e:
+            # 예외 발생 시 로깅하고 빈 문자열 반환
+            logger.error(f"Gemma 대화 이력 형식화 중 오류 발생: {str(e)}")
+            return ""
+
     async def handle_chat_with_history(self,
                                        request: ChatRequest,
                                        language: str,
@@ -431,9 +544,31 @@ class LlmHistoryHandler:
 
         return response
 
-    async def handle_chat_with_history_vllm(self,
-                                            request: ChatRequest,
-                                            language: str):
+    async def handle_chat_with_history_vllm(self, request: ChatRequest, language: str):
+        """
+        모델 유형에 따라 적절한 히스토리 핸들러로 디스패치합니다.
+
+        Args:
+            request (ChatRequest): 채팅 요청
+            language (str): 언어 코드
+
+        Returns:
+            tuple: (answer, retrieval_document)
+        """
+        if self.__class__.is_gemma_model():
+            logger.info(f"[{self.current_session_id}] Gemma 모델 감지됨, Gemma 전용 핸들러로 처리")
+            return await self.handle_chat_with_history_gemma(request, language)
+        else:
+            # 기존 개선된 핸들러 사용
+            if getattr(settings.llm, 'use_improved_history', False):
+                return await self.handle_chat_with_history_vllm_improved(request, language)
+            else:
+                # 기존 방식 사용
+                return await self._handle_chat_with_history_vllm_original(request, language)
+
+    async def _handle_chat_with_history_vllm_original(self,
+                                                      request: ChatRequest,
+                                                      language: str):
         """
         Handle chat requests using session history with VLLM.
         Optimized to use formatted history and avoid redundancy.
@@ -512,8 +647,13 @@ class LlmHistoryHandler:
         session_history = self.get_session_history()
         formatted_history = self.format_history_for_prompt(session_history, settings.llm.max_history_turns)
 
-        # 질문 재정의를 위한 프롬프트 템플릿
-        rewrite_prompt_template = """
+        # 대화 이력이 없는 경우 바로 원래 질문 사용
+        if not formatted_history or len(session_history.messages) == 0:
+            logger.debug(f"[{self.current_session_id}] 대화 이력이 없어 원래 질문을 사용합니다.")
+            rewritten_question = request.chat.user
+        else:
+            # 질문 재정의를 위한 프롬프트 템플릿
+            rewrite_prompt_template = """
     당신은 대화 컨텍스트를 고려하여 사용자의 질문을 명확하고 완전한 형태로 재작성하는 AI 도우미입니다.
     이전 대화 내용과 현재 질문을 고려하여, 대화 맥락이 충분히 반영된 독립적인 질문으로 재작성해주세요.
     다음 정보를 고려하세요:
@@ -529,32 +669,32 @@ class LlmHistoryHandler:
     재작성된 질문:
     """
 
-        # 질문 재정의 프롬프트 생성
-        rewrite_context = {
-            "history": formatted_history,
-            "input": request.chat.user,
-        }
+            # 질문 재정의 프롬프트 생성
+            rewrite_context = {
+                "history": formatted_history,
+                "input": request.chat.user,
+            }
 
-        rewrite_prompt = rewrite_prompt_template.format(**rewrite_context)
+            rewrite_prompt = rewrite_prompt_template.format(**rewrite_context)
 
-        # vLLM에 질문 재정의 요청
-        rewrite_request = VllmInquery(
-            request_id=f"{self.current_session_id}_rewrite",
-            prompt=rewrite_prompt
-        )
+            # vLLM에 질문 재정의 요청
+            rewrite_request = VllmInquery(
+                request_id=f"{self.current_session_id}_rewrite",
+                prompt=rewrite_prompt
+            )
 
-        logger.debug(f"[{self.current_session_id}] 질문 재정의 vLLM 요청 전송")
-        rewrite_response = await self.call_vllm_endpoint(rewrite_request)
-        rewritten_question = rewrite_response.get("generated_text", "").strip()
+            logger.debug(f"[{self.current_session_id}] 질문 재정의 vLLM 요청 전송")
+            rewrite_response = await self.call_vllm_endpoint(rewrite_request)
+            rewritten_question = rewrite_response.get("generated_text", "").strip()
 
-        # 재작성된 질문이 없거나 오류 발생 시 원래 질문 사용
-        if not rewritten_question or len(rewritten_question) < 5:
-            logger.warning(f"[{self.current_session_id}] 질문 재정의 실패, 원래 질문 사용")
-            rewritten_question = request.chat.user
-        else:
-            logger.debug(f"[{self.current_session_id}] 질문 재정의 성공: '{rewritten_question}'")
+            # 재작성된 질문이 없거나 오류 발생 시 원래 질문 사용
+            if not rewritten_question or len(rewritten_question) < 5:
+                logger.warning(f"[{self.current_session_id}] 질문 재정의 실패, 원래 질문 사용")
+                rewritten_question = request.chat.user
+            else:
+                logger.debug(f"[{self.current_session_id}] 질문 재정의 성공: '{rewritten_question}'")
 
-        # 2단계: 재정의된 질문으로 문서 검색
+            # 2단계: 재정의된 질문으로 문서 검색
         logger.debug(f"[{self.current_session_id}] 재정의된 질문으로 문서 검색 시작")
         retrieval_document = await self.retriever.ainvoke(rewritten_question)
         logger.debug(f"[{self.current_session_id}] 문서 검색 완료: {len(retrieval_document)}개 문서")
@@ -598,9 +738,29 @@ class LlmHistoryHandler:
 
         return answer, retrieval_document
 
-    async def handle_chat_with_history_vllm_streaming(self,
-                                                      request: ChatRequest,
-                                                      language: str):
+    async def handle_chat_with_history_vllm_streaming(self, request: ChatRequest, language: str):
+        """
+        모델 유형에 따라 적절한 스트리밍 히스토리 핸들러로 디스패치합니다.
+
+        Args:
+            request (ChatRequest): 채팅 요청
+            language (str): 언어 코드
+
+        Returns:
+            tuple: (vllm_request, retrieval_document)
+        """
+        if self.__class__.is_gemma_model():
+            logger.info(f"[{self.current_session_id}] Gemma 모델 감지됨, Gemma 스트리밍 핸들러로 처리")
+            return await self.handle_chat_with_history_gemma_streaming(request, language)
+        else:
+            # 기존 개선된 핸들러 사용
+            if getattr(settings.llm, 'use_improved_history', False):
+                return await self.handle_chat_with_history_vllm_streaming_improved(request, language)
+            else:
+                # 기존 방식 사용
+                return await self._handle_chat_with_history_vllm_streaming_original(request, language)
+
+    async def _handle_chat_with_history_vllm_streaming_original(self, request: ChatRequest, language: str):
         """
         VLLM을 사용하여 스트리밍 모드로 세션 히스토리 기반 채팅 요청 처리.
 
@@ -682,59 +842,64 @@ class LlmHistoryHandler:
         session_history = self.get_session_history()
         formatted_history = self.format_history_for_prompt(session_history, settings.llm.max_history_turns)
 
-        # 질문 재정의를 위한 프롬프트 템플릿
-        rewrite_prompt_template = """
-    당신은 대화 컨텍스트를 고려하여 사용자의 질문을 명확하고 완전한 형태로 재작성하는 AI 도우미입니다.
-    이전 대화 내용과 현재 질문을 고려하여, 대화 맥락이 충분히 반영된 독립적인 질문으로 재작성해주세요.
-    다음 정보를 고려하세요:
-    1. 현재 질문에서 생략된 맥락을 이전 대화에서 찾아 보완하세요.
-    2. 대명사(이것, 그것, 저것 등)는 실제 지칭하는 대상으로 바꿔주세요.
-    3. 간결하면서도 정확한 질문으로 재작성하세요.
-    4. 재작성된 질문만 출력하세요. 설명이나 다른 텍스트는 포함하지 마세요.
+        # 대화 이력이 없는 경우 바로 원래 질문 사용
+        if not formatted_history or len(session_history.messages) == 0:
+            logger.debug(f"[{session_id}] 대화 이력이 없어 원래 질문을 사용합니다.")
+            rewritten_question = request.chat.user
+        else:
+            # 질문 재정의를 위한 프롬프트 템플릿
+            rewrite_prompt_template = """
+                당신은 대화 컨텍스트를 고려하여 사용자의 질문을 명확하고 완전한 형태로 재작성하는 AI 도우미입니다.
+                이전 대화 내용과 현재 질문을 고려하여, 대화 맥락이 충분히 반영된 독립적인 질문으로 재작성해주세요.
+                다음 정보를 고려하세요:
+                1. 현재 질문에서 생략된 맥락을 이전 대화에서 찾아 보완하세요.
+                2. 대명사(이것, 그것, 저것 등)는 실제 지칭하는 대상으로 바꿔주세요.
+                3. 간결하면서도 정확한 질문으로 재작성하세요.
+                4. 재작성된 질문만 출력하세요. 설명이나 다른 텍스트는 포함하지 마세요.
 
-    {history}
+                {history}
 
-    현재 질문: {input}
+                현재 질문: {input}
 
-    재작성된 질문:
-    """
+                재작성된 질문:
+                """
 
-        # 질문 재정의 프롬프트 생성
-        rewrite_context = {
-            "history": formatted_history,
-            "input": request.chat.user,
-        }
+            # 질문 재정의 프롬프트 생성
+            rewrite_context = {
+                "history": formatted_history,
+                "input": request.chat.user,
+            }
 
-        rewrite_prompt = rewrite_prompt_template.format(**rewrite_context)
+            rewrite_prompt = rewrite_prompt_template.format(**rewrite_context)
 
-        # vLLM에 질문 재정의 요청
-        rewrite_request = VllmInquery(
-            request_id=f"{session_id}_rewrite",
-            prompt=rewrite_prompt
-        )
-
-        logger.debug(f"[{session_id}] 질문 재정의 vLLM 요청 전송")
-        try:
-            # 질문 재정의 요청에 타임아웃 적용 (최대 3초)
-            rewrite_timeout = getattr(settings.llm, 'rewrite_timeout', 3.0)
-            rewrite_response = await asyncio.wait_for(
-                self.call_vllm_endpoint(rewrite_request),
-                timeout=rewrite_timeout
+            # vLLM에 질문 재정의 요청
+            rewrite_request = VllmInquery(
+                request_id=f"{session_id}_rewrite",
+                prompt=rewrite_prompt
             )
-            rewritten_question = rewrite_response.get("generated_text", "").strip()
 
-            # 재작성된 질문이 없거나 오류 발생 시 원래 질문 사용
-            if not rewritten_question or len(rewritten_question) < 5:
-                logger.warning(f"[{session_id}] 질문 재정의 실패, 원래 질문 사용")
+            logger.debug(f"[{session_id}] 질문 재정의 vLLM 요청 전송")
+            try:
+                # 질문 재정의 요청에 타임아웃 적용 (최대 3초)
+                rewrite_timeout = getattr(settings.llm, 'rewrite_timeout', 3.0)
+                rewrite_response = await asyncio.wait_for(
+                    self.call_vllm_endpoint(rewrite_request),
+                    timeout=rewrite_timeout
+                )
+                rewritten_question = rewrite_response.get("generated_text", "").strip()
+
+                # 재작성된 질문이 없거나 오류 발생 시 원래 질문 사용
+                if not rewritten_question or len(rewritten_question) < 5:
+                    logger.warning(f"[{session_id}] 질문 재정의 실패, 원래 질문 사용")
+                    rewritten_question = request.chat.user
+                else:
+                    logger.debug(f"[{session_id}] 질문 재정의 성공: '{rewritten_question}'")
+            except asyncio.TimeoutError:
+                logger.warning(f"[{session_id}] 질문 재정의 타임아웃, 원래 질문 사용")
                 rewritten_question = request.chat.user
-            else:
-                logger.debug(f"[{session_id}] 질문 재정의 성공: '{rewritten_question}'")
-        except asyncio.TimeoutError:
-            logger.warning(f"[{session_id}] 질문 재정의 타임아웃, 원래 질문 사용")
-            rewritten_question = request.chat.user
-        except Exception as e:
-            logger.error(f"[{session_id}] 질문 재정의 오류: {str(e)}")
-            rewritten_question = request.chat.user
+            except Exception as e:
+                logger.error(f"[{session_id}] 질문 재정의 오류: {str(e)}")
+                rewritten_question = request.chat.user
 
         # 2단계: 재정의된 질문으로 문서 검색
         logger.debug(f"[{session_id}] 재정의된 질문으로 문서 검색 시작")
@@ -818,6 +983,261 @@ class LlmHistoryHandler:
         )
 
         logger.debug(f"[{session_id}] 스트리밍 요청 준비 완료")
+
+        # 성능 개선을 위한 통계 측정
+        self.response_stats = {
+            "rewrite_time": 0,
+            "retrieval_time": 0,
+            "total_prep_time": time.time()
+        }
+
+        return vllm_request, retrieval_document
+
+    async def handle_chat_with_history_gemma(self,
+                                             request: ChatRequest,
+                                             language: str):
+        """
+        Gemma 모델을 사용하여 2단계 접근법으로 대화 이력을 처리합니다.
+        1. 대화 이력과 현재 질문을 사용하여 독립적인 질문 생성
+        2. 독립적인 질문으로 문서를 검색하고 최종 응답 생성
+
+        Args:
+            request (ChatRequest): 채팅 요청
+            language (str): 언어 코드
+
+        Returns:
+            tuple: (answer, retrieval_document)
+        """
+        logger.debug(f"[{self.current_session_id}] Gemma 모델을 위한 히스토리 처리 시작")
+
+        # 1단계: 대화 이력을 사용하여 독립적인 질문 생성
+        # 대화 이력 가져오기
+        session_history = self.get_session_history()
+        formatted_history = self.format_history_for_gemma(session_history, settings.llm.max_history_turns)
+
+        # 대화 이력이 없는 경우 바로 원래 질문 사용
+        if not formatted_history or len(session_history.messages) == 0:
+            logger.debug(f"[{self.current_session_id}] 대화 이력이 없어 원래 질문을 사용합니다.")
+            rewritten_question = request.chat.user
+        else:
+            # 질문 재정의를 위한 프롬프트 템플릿 (Gemma 형식으로 직접 구성)
+            rewrite_prompt_template = """
+            당신은 대화 컨텍스트를 고려하여 사용자의 질문을 명확하고 완전한 형태로 재작성하는 AI 도우미입니다.
+            이전 대화 내용과 현재 질문을 고려하여, 대화 맥락이 충분히 반영된 독립적인 질문으로 재작성해주세요.
+            다음 정보를 고려하세요:
+            1. 현재 질문에서 생략된 맥락을 이전 대화에서 찾아 보완하세요.
+            2. 대명사(이것, 그것, 저것 등)는 실제 지칭하는 대상으로 바꿔주세요.
+            3. 간결하면서도 정확한 질문으로 재작성하세요.
+            4. 재작성된 질문만 출력하세요. 설명이나 다른 텍스트는 포함하지 마세요.
+
+            {history}
+
+            현재 질문: {input}
+
+            재작성된 질문:
+            """
+
+            # 질문 재정의 프롬프트 생성
+            rewrite_context = {
+                "history": formatted_history,
+                "input": request.chat.user,
+            }
+
+            # Gemma 형식으로 프롬프트 변환
+            rewrite_prompt = self.build_system_prompt_gemma(rewrite_prompt_template, rewrite_context)
+
+            # vLLM에 질문 재정의 요청
+            rewrite_request = VllmInquery(
+                request_id=f"{self.current_session_id}_rewrite",
+                prompt=rewrite_prompt
+            )
+
+            logger.debug(f"[{self.current_session_id}] 질문 재정의 Gemma 요청 전송")
+            rewrite_response = await self.call_vllm_endpoint(rewrite_request)
+            rewritten_question = rewrite_response.get("generated_text", "").strip()
+
+            # 재작성된 질문이 없거나 오류 발생 시 원래 질문 사용
+            if not rewritten_question or len(rewritten_question) < 5:
+                logger.warning(f"[{self.current_session_id}] 질문 재정의 실패, 원래 질문 사용")
+                rewritten_question = request.chat.user
+            else:
+                logger.debug(f"[{self.current_session_id}] 질문 재정의 성공: '{rewritten_question}'")
+
+        # 2단계: 재정의된 질문으로 문서 검색
+        logger.debug(f"[{self.current_session_id}] 재정의된 질문으로 문서 검색 시작")
+        retrieval_document = await self.retriever.ainvoke(rewritten_question)
+        logger.debug(f"[{self.current_session_id}] 문서 검색 완료: {len(retrieval_document)}개 문서")
+
+        # 3단계: 최종 응답 생성
+        # RAG 프롬프트 템플릿 가져오기
+        rag_prompt_template = self.response_generator.get_rag_qa_prompt(self.current_rag_sys_info)
+
+        # 최종 응답 생성을 위한 컨텍스트 준비
+        final_prompt_context = {
+            "input": request.chat.user,  # 원래 질문 사용
+            "rewritten_question": rewritten_question,  # 재작성된 질문도 제공
+            "history": formatted_history,  # 형식화된 대화 이력
+            "context": retrieval_document,  # 검색된 문서
+            "language": language,
+            "today": self.response_generator.get_today(),
+        }
+
+        # VOC 관련 설정 추가 (필요한 경우)
+        if self.request.meta.rag_sys_info == "komico_voc":
+            final_prompt_context.update({
+                "gw_doc_id_prefix_url": settings.voc.gw_doc_id_prefix_url,
+                "check_gw_word_link": settings.voc.check_gw_word_link,
+                "check_gw_word": settings.voc.check_gw_word,
+                "check_block_line": settings.voc.check_block_line,
+            })
+
+        # Gemma 형식으로 최종 시스템 프롬프트 생성
+        vllm_inquery_context = self.build_system_prompt_gemma(rag_prompt_template, final_prompt_context)
+
+        # vLLM에 최종 응답 요청
+        vllm_request = VllmInquery(
+            request_id=self.request.meta.session_id,
+            prompt=vllm_inquery_context
+        )
+
+        logger.debug(f"[{self.current_session_id}] 최종 응답 생성 Gemma 요청 전송")
+        response = await self.call_vllm_endpoint(vllm_request)
+        answer = response.get("generated_text", "") or response.get("answer", "")
+        logger.debug(f"[{self.current_session_id}] 최종 응답 생성 완료, 응답 길이: {len(answer)}")
+
+        return answer, retrieval_document
+
+    async def handle_chat_with_history_gemma_streaming(self,
+                                                       request: ChatRequest,
+                                                       language: str):
+        """
+        Gemma 모델을 사용하여 2단계 접근법으로 스트리밍 모드의 대화 이력을 처리합니다.
+        1. 대화 이력과 현재 질문을 사용하여 독립적인 질문 생성
+        2. 독립적인 질문으로 문서를 검색하고 스트리밍 응답 생성
+
+        Args:
+            request (ChatRequest): 채팅 요청
+            language (str): 언어 코드
+
+        Returns:
+            tuple: (vllm_request, retrieval_document) - 스트리밍용 요청 객체와 검색된 문서
+        """
+        session_id = self.current_session_id
+        logger.debug(f"[{session_id}] Gemma 모델을 위한 스트리밍 히스토리 처리 시작")
+
+        # 1단계: 대화 이력을 사용하여 독립적인 질문 생성
+        # 대화 이력 가져오기
+        session_history = self.get_session_history()
+        formatted_history = self.format_history_for_gemma(session_history, settings.llm.max_history_turns)
+
+        # 대화 이력이 없는 경우 바로 원래 질문 사용
+        if not formatted_history or len(session_history.messages) == 0:
+            logger.debug(f"[{session_id}] 대화 이력이 없어 원래 질문을 사용합니다.")
+            rewritten_question = request.chat.user
+        else:
+            # 질문 재정의를 위한 프롬프트 템플릿
+            rewrite_prompt_template = """
+                당신은 대화 컨텍스트를 고려하여 사용자의 질문을 명확하고 완전한 형태로 재작성하는 AI 도우미입니다.
+                이전 대화 내용과 현재 질문을 고려하여, 대화 맥락이 충분히 반영된 독립적인 질문으로 재작성해주세요.
+                다음 정보를 고려하세요:
+                1. 현재 질문에서 생략된 맥락을 이전 대화에서 찾아 보완하세요.
+                2. 대명사(이것, 그것, 저것 등)는 실제 지칭하는 대상으로 바꿔주세요.
+                3. 간결하면서도 정확한 질문으로 재작성하세요.
+                4. 재작성된 질문만 출력하세요. 설명이나 다른 텍스트는 포함하지 마세요.
+            
+                {history}
+            
+                현재 질문: {input}
+            
+                재작성된 질문:
+                """
+
+            # 질문 재정의 프롬프트 생성
+            rewrite_context = {
+                "history": formatted_history,
+                "input": request.chat.user,
+            }
+
+            # Gemma 형식으로 프롬프트 변환
+            rewrite_prompt = self.build_system_prompt_gemma(rewrite_prompt_template, rewrite_context)
+
+            # vLLM에 질문 재정의 요청
+            rewrite_request = VllmInquery(
+                request_id=f"{session_id}_rewrite",
+                prompt=rewrite_prompt
+            )
+
+            logger.debug(f"[{session_id}] 질문 재정의 Gemma 요청 전송")
+            try:
+                # 질문 재정의 요청에 타임아웃 적용 (최대 3초)
+                rewrite_timeout = getattr(settings.llm, 'rewrite_timeout', 3.0)
+                rewrite_response = await asyncio.wait_for(
+                    self.call_vllm_endpoint(rewrite_request),
+                    timeout=rewrite_timeout
+                )
+                rewritten_question = rewrite_response.get("generated_text", "").strip()
+
+                # 재작성된 질문이 없거나 오류 발생 시 원래 질문 사용
+                if not rewritten_question or len(rewritten_question) < 5:
+                    logger.warning(f"[{session_id}] 질문 재정의 실패, 원래 질문 사용")
+                    rewritten_question = request.chat.user
+                else:
+                    logger.debug(f"[{session_id}] 질문 재정의 성공: '{rewritten_question}'")
+            except asyncio.TimeoutError:
+                logger.warning(f"[{session_id}] 질문 재정의 타임아웃, 원래 질문 사용")
+                rewritten_question = request.chat.user
+            except Exception as e:
+                logger.error(f"[{session_id}] 질문 재정의 오류: {str(e)}")
+                rewritten_question = request.chat.user
+
+        # 2단계: 재정의된 질문으로 문서 검색
+        logger.debug(f"[{session_id}] 재정의된 질문으로 문서 검색 시작")
+        retrieval_document = []  # 기본값으로 빈 리스트 설정
+
+        try:
+            # 검색기가 초기화되어 있는지 확인 (오류 방지)
+            if self.retriever is not None:
+                retrieval_document = await self.retriever.ainvoke(rewritten_question)
+                logger.debug(f"[{session_id}] 문서 검색 완료: {len(retrieval_document)}개 문서")
+            else:
+                logger.warning(f"[{session_id}] 검색기가 초기화되지 않았습니다. 빈 문서 리스트 사용")
+        except Exception as e:
+            logger.error(f"[{session_id}] 문서 검색 중 오류: {str(e)}")
+
+        # 3단계: 최종 스트리밍 응답 준비
+        # RAG 프롬프트 템플릿 가져오기
+        rag_prompt_template = self.response_generator.get_rag_qa_prompt(self.current_rag_sys_info)
+
+        # 최종 응답 생성을 위한 컨텍스트 준비
+        final_prompt_context = {
+            "input": request.chat.user,  # 원래 질문 사용
+            "rewritten_question": rewritten_question,  # 재작성된 질문도 제공
+            "history": formatted_history,  # 형식화된 대화 이력
+            "context": retrieval_document,  # 검색된 문서
+            "language": language,
+            "today": self.response_generator.get_today(),
+        }
+
+        # VOC 관련 설정 추가 (필요한 경우)
+        if request.meta.rag_sys_info == "komico_voc":
+            final_prompt_context.update({
+                "gw_doc_id_prefix_url": settings.voc.gw_doc_id_prefix_url,
+                "check_gw_word_link": settings.voc.check_gw_word_link,
+                "check_gw_word": settings.voc.check_gw_word,
+                "check_block_line": settings.voc.check_block_line,
+            })
+
+        # 최종 시스템 프롬프트 생성 (Gemma 형식)
+        vllm_inquery_context = self.build_system_prompt_gemma(rag_prompt_template, final_prompt_context)
+
+        # 스트리밍을 위한 vLLM 요청 생성
+        vllm_request = VllmInquery(
+            request_id=session_id,
+            prompt=vllm_inquery_context,
+            stream=True  # 스트리밍 모드 활성화
+        )
+
+        logger.debug(f"[{session_id}] Gemma 스트리밍 요청 준비 완료")
 
         # 성능 개선을 위한 통계 측정
         self.response_stats = {

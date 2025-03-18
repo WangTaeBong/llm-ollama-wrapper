@@ -564,6 +564,28 @@ class LLMService:
             )
             raise
 
+    @classmethod
+    def is_gemma_model(cls) -> bool:
+        """
+        현재 모델이 Gemma 모델인지 확인합니다.
+
+        Returns:
+            bool: Gemma 모델이면 True, 아니면 False
+        """
+        # OLLAMA 설정에서 모델 이름 확인
+        if hasattr(settings, 'ollama') and hasattr(settings.ollama, 'model_name'):
+            model_name = settings.ollama.model_name.lower()
+            return 'gemma' in model_name
+
+        # VLLM 설정에서 model_type 확인
+        if hasattr(settings, 'llm') and hasattr(settings.llm, 'model_type'):
+            model_type = settings.llm.model_type.lower() if hasattr(settings.llm.model_type, 'lower') else str(
+                settings.llm.model_type).lower()
+            return model_type == 'gemma'
+
+        # 기본적으로 False 반환
+        return False
+
     def _initialize_system_prompt_vllm(self):
         """
         Initialize system prompt template for vLLM.
@@ -609,6 +631,46 @@ class LLMService:
         except Exception as e:
             logger.error(f"[{session_id}] System prompt build failed: {str(e)}")
             raise
+
+    def build_system_prompt_gemma(self, context):
+        """
+        Gemma에 맞는 형식으로 시스템 프롬프트를 구성합니다.
+
+        Args:
+            context (dict): 템플릿에 적용할 변수들
+
+        Returns:
+            str: Gemma 형식의 시스템 프롬프트
+        """
+        session_id = self.request.meta.session_id
+        try:
+            # 먼저 기존 함수로 프롬프트 생성
+            raw_prompt = self.build_system_prompt(context)
+
+            # Gemma 형식으로 변환
+            # <start_of_turn>user 형식으로 시작
+            formatted_prompt = "<start_of_turn>user\n"
+
+            # 시스템 프롬프트 삽입
+            formatted_prompt += raw_prompt
+
+            # 사용자 입력부 종료 및 모델 응답 시작
+            formatted_prompt += "\n<end_of_turn>\n<start_of_turn>model\n"
+
+            return formatted_prompt
+
+        except KeyError as e:
+            # 누락된 키 처리
+            missing_key = str(e).strip("'")
+            logger.warning(f"[{session_id}] 시스템 프롬프트 템플릿에 키가 누락됨: {missing_key}, 빈 문자열로 대체합니다.")
+            context[missing_key] = ""
+            return self.build_system_prompt_gemma(context)
+        except Exception as e:
+            # 기타 예외 처리
+            logger.error(f"[{session_id}] Gemma 시스템 프롬프트 형식화 중 오류: {e}")
+            # 기본 Gemma 프롬프트로 폴백
+            basic_prompt = f"<start_of_turn>user\n다음 질문에 답해주세요: {context.get('input', '질문 없음')}\n<end_of_turn>\n<start_of_turn>model\n"
+            return basic_prompt
 
     @async_retry(max_retries=2, backoff_factor=2, circuit_breaker=_vllm_circuit_breaker)
     async def call_vllm_endpoint(self, data: VllmInquery):
@@ -826,8 +888,15 @@ class LLMService:
         try:
             # vLLM 엔진만 현재 스트리밍 지원
             if settings.llm.llm_backend.lower() == "vllm":
-                # 시스템 프롬프트 생성
-                vllm_inquery_context = self.build_system_prompt(context)
+                # 모델이 Gemma인지 확인
+                use_gemma_format = self.__class__.is_gemma_model()
+
+                if use_gemma_format:
+                    logger.debug(f"[{session_id}] Gemma 모델 감지됨, Gemma 형식 사용")
+                    vllm_inquery_context = self.build_system_prompt_gemma(context)
+                else:
+                    # 시스템 프롬프트 생성
+                    vllm_inquery_context = self.build_system_prompt(context)
 
                 # 스트리밍을 위한 vLLM 요청 준비
                 vllm_request = VllmInquery(
@@ -945,7 +1014,15 @@ class LLMService:
                     result = await result
             elif settings.llm.llm_backend.lower() == "vllm":
                 logger.debug(f"[{session_id}] Starting vLLM invocation")
-                vllm_inquery_context = self.build_system_prompt(context)
+
+                # 모델이 Gemma인지 확인 (클래스 메서드로 호출)
+                use_gemma_format = self.__class__.is_gemma_model()
+
+                if use_gemma_format:
+                    logger.debug(f"[{session_id}] Gemma 모델 감지됨, Gemma 형식 사용")
+                    vllm_inquery_context = self.build_system_prompt_gemma(context)
+                else:
+                    vllm_inquery_context = self.build_system_prompt(context)
 
                 vllm_request = VllmInquery(
                     request_id=session_id,
@@ -1775,17 +1852,10 @@ class ChatService:
                     # Process chat with history for vLLM
                     await self._log("debug", f"[{session_id}] Processing chat with history for vLLM backend")
 
-                    use_improved_history = getattr(settings.llm, 'use_improved_history', False)
-
-                    if use_improved_history:
-                        result = await self.history_handler.handle_chat_with_history_vllm_improved(
-                            self.request, trans_lang
-                        )
-                    else:
-                        # 기존 방식 사용
-                        result = await self.history_handler.handle_chat_with_history_vllm(
-                            self.request, trans_lang
-                        )
+                    # 기존 히스토리 핸들러 호출 - 이미 내부에서 자동으로 Gemma 모델을 감지합니다
+                    result = await self.history_handler.handle_chat_with_history_vllm(
+                        self.request, trans_lang
+                    )
 
                     if result:
                         query_answer = result[0]
