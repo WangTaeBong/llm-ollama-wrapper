@@ -26,6 +26,7 @@ from src.services.custom_retriever import CustomRetriever
 from src.services.response_generator import ResponseGenerator
 from src.utils.prompt import PromptManager
 from src.utils.redis_utils import RedisUtils
+from src.utils.history_prompt_manager import PromptManager
 
 # Load settings
 settings = ConfigLoader().get_settings()
@@ -658,21 +659,8 @@ class LlmHistoryHandler:
             rewritten_question = request.chat.user
         else:
             # 질문 재정의를 위한 프롬프트 템플릿
-            rewrite_prompt_template = """
-    당신은 대화 컨텍스트를 고려하여 사용자의 질문을 명확하고 완전한 형태로 재작성하는 AI 도우미입니다.
-    이전 대화 내용과 현재 질문을 고려하여, 대화 맥락이 충분히 반영된 독립적인 질문으로 재작성해주세요.
-    다음 정보를 고려하세요:
-    1. 현재 질문에서 생략된 맥락을 이전 대화에서 찾아 보완하세요.
-    2. 대명사(이것, 그것, 저것 등)는 실제 지칭하는 대상으로 바꿔주세요.
-    3. 간결하면서도 정확한 질문으로 재작성하세요.
-    4. 재작성된 질문만 출력하세요. 설명이나 다른 텍스트는 포함하지 마세요.
-
-    {history}
-
-    현재 질문: {input}
-
-    재작성된 질문:
-    """
+            # JSON 파일에서 템플릿 불러오기
+            rewrite_prompt_template = PromptManager.get_rewrite_prompt_template()
 
             # 질문 재정의 프롬프트 생성
             rewrite_context = {
@@ -699,7 +687,7 @@ class LlmHistoryHandler:
             else:
                 logger.debug(f"[{self.current_session_id}] 질문 재정의 성공: '{rewritten_question}'")
 
-            # 2단계: 재정의된 질문으로 문서 검색
+        # 2단계: 재정의된 질문으로 문서 검색
         logger.debug(f"[{self.current_session_id}] 재정의된 질문으로 문서 검색 시작")
         retrieval_document = await self.retriever.ainvoke(rewritten_question)
         logger.debug(f"[{self.current_session_id}] 문서 검색 완료: {len(retrieval_document)}개 문서")
@@ -853,21 +841,9 @@ class LlmHistoryHandler:
             rewritten_question = request.chat.user
         else:
             # 질문 재정의를 위한 프롬프트 템플릿
-            rewrite_prompt_template = """
-                당신은 대화 컨텍스트를 고려하여 사용자의 질문을 명확하고 완전한 형태로 재작성하는 AI 도우미입니다.
-                이전 대화 내용과 현재 질문을 고려하여, 대화 맥락이 충분히 반영된 독립적인 질문으로 재작성해주세요.
-                다음 정보를 고려하세요:
-                1. 현재 질문에서 생략된 맥락을 이전 대화에서 찾아 보완하세요.
-                2. 대명사(이것, 그것, 저것 등)는 실제 지칭하는 대상으로 바꿔주세요.
-                3. 간결하면서도 정확한 질문으로 재작성하세요.
-                4. 재작성된 질문만 출력하세요. 설명이나 다른 텍스트는 포함하지 마세요.
-
-                {history}
-
-                현재 질문: {input}
-
-                재작성된 질문:
-                """
+            # JSON 파일에서 템플릿 불러오기
+            from src.utils.prompt import PromptManager
+            rewrite_prompt_template = PromptManager.get_rewrite_prompt_template()
 
             # 질문 재정의 프롬프트 생성
             rewrite_context = {
@@ -1033,21 +1009,8 @@ class LlmHistoryHandler:
             rewritten_question = request.chat.user
         else:
             # 질문 재정의를 위한 프롬프트 템플릿 (Gemma 형식으로 직접 구성)
-            rewrite_prompt_template = """
-            당신은 대화 컨텍스트를 고려하여 사용자의 질문을 명확하고 완전한 형태로 재작성하는 AI 도우미입니다.
-            이전 대화 내용과 현재 질문을 고려하여, 대화 맥락이 충분히 반영된 독립적인 질문으로 재작성해주세요.
-            다음 정보를 고려하세요:
-            1. 현재 질문에서 생략된 맥락을 이전 대화에서 찾아 보완하세요.
-            2. 대명사(이것, 그것, 저것 등)는 실제 지칭하는 대상으로 바꿔주세요.
-            3. 간결하면서도 정확한 질문으로 재작성하세요.
-            4. 재작성된 질문만 출력하세요. 설명이나 다른 텍스트는 포함하지 마세요.
-
-            {history}
-
-            현재 질문: {input}
-
-            재작성된 질문:
-            """
+            # JSON 파일에서 템플릿 불러오기
+            rewrite_prompt_template = PromptManager.get_rewrite_prompt_template()
 
             # 질문 재정의 프롬프트 생성
             rewrite_context = {
@@ -1148,21 +1111,8 @@ class LlmHistoryHandler:
             rewritten_question = request.chat.user
         else:
             # 질문 재정의를 위한 프롬프트 템플릿
-            rewrite_prompt_template = """
-                당신은 대화 컨텍스트를 고려하여 사용자의 질문을 명확하고 완전한 형태로 재작성하는 AI 도우미입니다.
-                이전 대화 내용과 현재 질문을 고려하여, 대화 맥락이 충분히 반영된 독립적인 질문으로 재작성해주세요.
-                다음 정보를 고려하세요:
-                1. 현재 질문에서 생략된 맥락을 이전 대화에서 찾아 보완하세요.
-                2. 대명사(이것, 그것, 저것 등)는 실제 지칭하는 대상으로 바꿔주세요.
-                3. 간결하면서도 정확한 질문으로 재작성하세요.
-                4. 재작성된 질문만 출력하세요. 설명이나 다른 텍스트는 포함하지 마세요.
-            
-                {history}
-            
-                현재 질문: {input}
-            
-                재작성된 질문:
-                """
+            # JSON 파일에서 템플릿 불러오기
+            rewrite_prompt_template = PromptManager.get_rewrite_prompt_template()
 
             # 질문 재정의 프롬프트 생성
             rewrite_context = {

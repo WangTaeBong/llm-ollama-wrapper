@@ -236,6 +236,11 @@ class ResponseGenerator:
         Returns:
             str: Answer text with added reference information
         """
+        # 이미 참고문헌이 있는지 확인
+        if reference_word in query_answer:
+            logger.debug(f"References already exist in the answer, skipping addition")
+            return query_answer
+
         # Return original if no answer or no reference documents
         if not query_answer or not retriever_documents:
             return query_answer
