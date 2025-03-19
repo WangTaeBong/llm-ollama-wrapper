@@ -13,7 +13,7 @@ Classes:
 """
 
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, field_validator, Field
 
@@ -102,6 +102,8 @@ class ChatReq(BaseModel):
     category2: Optional[str] = Field(default=None, description="Secondary category")
     category3: Optional[str] = Field(default=None, description="Tertiary category")
     payload: List[PayloadReq] = Field(default_factory=list, description="Document payloads")
+    # 이미지 처리를 위한 새로운 필드 추가
+    image: Optional[Dict[str, str]] = Field(default=None, description="Image data")
 
     @classmethod
     @field_validator("payload", mode="before")
