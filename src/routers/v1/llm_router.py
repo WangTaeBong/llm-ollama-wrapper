@@ -1,12 +1,14 @@
 import logging
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from starlette.responses import StreamingResponse
 
 from src.schema.chat_req import ChatRequest
 from src.schema.chat_res import ChatResponse
-from src.services.llm_ollama_process import ChatService
+from src.services.chat.factory import ChatServiceFactory
 from src.common.config_loader import ConfigLoader
+from src.common.dependencies import get_validated_request, log_request
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -16,53 +18,6 @@ settings = ConfigLoader().get_settings()
 
 # Router configuration
 llm_router = APIRouter(prefix='/v1', tags=["LLM Chat"])
-
-
-async def log_request(request: ChatRequest) -> ChatRequest:
-    """
-    Dependency function for logging incoming requests.
-
-    Logs the content of chat requests in debug mode with sensitive information masked.
-    This function maintains a balance between comprehensive logging for debugging
-    purposes and security/privacy concerns.
-
-    Args:
-        request (ChatRequest): The original chat request object
-
-    Returns:
-        ChatRequest: The unmodified original request object (passed through)
-    """
-    # Create a deep copy of the request to avoid modifying the original
-    safe_request = request.copy(deep=True)
-
-    # Mask sensitive information (if present)
-    if hasattr(safe_request, 'api_key') and getattr(safe_request, 'api_key', None):
-        setattr(safe_request, 'api_key', "********")  # Mask API key
-
-    # Log basic request info at INFO level
-    logger.info(f"Request[{safe_request.meta.rag_sys_info}/{safe_request.meta.session_id}] {safe_request.chat.user}")
-
-    # Log detailed request data at DEBUG level
-    logger.debug(f"Received chat request: {safe_request}")
-
-    return request
-
-
-def get_chat_service(request: ChatRequest) -> ChatService:
-    """
-    Dependency function for creating a ChatService instance.
-
-    Initializes and returns a new ChatService instance configured with the
-    provided request parameters. This dependency injection approach simplifies
-    testing and allows for better separation of concerns.
-
-    Args:
-        request (ChatRequest): The validated chat request object
-
-    Returns:
-        ChatService: An initialized ChatService instance ready to process the request
-    """
-    return ChatService(request)
 
 
 @llm_router.post(
@@ -78,8 +33,7 @@ def get_chat_service(request: ChatRequest) -> ChatService:
     }
 )
 async def chat(
-        request: ChatRequest = Depends(log_request),
-        chat_service: ChatService = Depends(get_chat_service),
+        request: Annotated[ChatRequest, Depends(log_request)],
 ) -> ChatResponse:
     """
     Endpoint for processing chat requests.
@@ -89,13 +43,8 @@ async def chat(
     2. Processes the message through the LLM service
     3. Returns the generated response or appropriate error
 
-    The function uses FastAPI's dependency injection system to:
-    - Log the incoming request (via log_request)
-    - Initialize the chat service (via get_chat_service)
-
     Args:
         request (ChatRequest): The validated chat request data
-        chat_service (ChatService): The initialized chat service instance
 
     Returns:
         ChatResponse: The processed chat response from the LLM
@@ -106,6 +55,9 @@ async def chat(
     """
     try:
         logger.info(f"[{request.meta.session_id}] 채팅 요청 수신")
+
+        # Get chat service instance via factory
+        chat_service = await ChatServiceFactory.create_service(request)
 
         # Process the chat request
         response = await chat_service.process_chat()
@@ -143,8 +95,20 @@ async def chat(
         )
 
 
-@llm_router.post(path="/chat/stream", response_class=StreamingResponse)
-async def chat_stream(request: ChatRequest, background_tasks: BackgroundTasks):
+@llm_router.post(
+    path="/chat/stream",
+    response_class=StreamingResponse,
+    summary="Stream chat responses",
+    description="Incrementally stream chat responses to the client using SSE format",
+    responses={
+        400: {"description": "Invalid request parameters"},
+        500: {"description": "Internal server error"}
+    }
+)
+async def chat_stream(
+        request: Annotated[ChatRequest, Depends(log_request)],
+        background_tasks: BackgroundTasks
+):
     """
     스트리밍 채팅 API 엔드포인트
 
@@ -167,9 +131,9 @@ async def chat_stream(request: ChatRequest, background_tasks: BackgroundTasks):
         # 오류 응답 스트림
         async def error_stream():
             error_msg = {"error": True, "text": "스트리밍이 서버 설정에서 비활성화되어 있습니다.", "finished": True}
-            yield f"data: {json.dumps(error_msg)}\n\n"
+            yield f"data: {json.dumps(error_msg, ensure_ascii=False)}\n\n"
 
-        return StreamingResponse(error_stream(), media_type="text/event-stream")
+        return StreamingResponse(error_stream(), media_type="text/event-stream; charset=utf-8")
 
     # vLLM 백엔드 확인
     if settings.llm.llm_backend.lower() != "vllm":
@@ -178,14 +142,14 @@ async def chat_stream(request: ChatRequest, background_tasks: BackgroundTasks):
         # 오류 응답 스트림
         async def error_stream():
             error_msg = {"error": True, "text": "스트리밍은 vLLM 백엔드에서만 지원됩니다.", "finished": True}
-            yield f"data: {json.dumps(error_msg)}\n\n"
+            yield f"data: {json.dumps(error_msg, ensure_ascii=False)}\n\n"
 
-        return StreamingResponse(error_stream(), media_type="text/event-stream")
-
-    # 채팅 서비스 초기화
-    chat_service = ChatService(request)
+        return StreamingResponse(error_stream(), media_type="text/event-stream; charset=utf-8")
 
     try:
+        # Get chat service instance via factory
+        chat_service = await ChatServiceFactory.create_service(request)
+
         # 스트리밍 응답 처리
         response = await chat_service.stream_chat(background_tasks)
 
@@ -199,6 +163,7 @@ async def chat_stream(request: ChatRequest, background_tasks: BackgroundTasks):
         # 오류 응답 스트림
         async def error_stream():
             # 중요: JSON 직렬화 시 ensure_ascii=False 설정
+            import json
             error_msg = json.dumps(
                 {"error": True, "text": f"처리 중 오류가 발생했습니다: {str(e)}", "finished": True},
                 ensure_ascii=False
