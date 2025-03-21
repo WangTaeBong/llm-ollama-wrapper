@@ -24,8 +24,8 @@ from langchain_core.prompts import PromptTemplate
 
 from src.common.restclient import rc
 from src.schema.vllm_inquery import VllmInquery
-from src.services.core.llm.base import LLMServiceBase
-from src.services.core.llm.factory import LLMServiceFactory
+from .base import LLMServiceBase
+from .factory import LLMServiceFactory
 
 # 로거 설정
 logger = logging.getLogger(__name__)
@@ -49,6 +49,11 @@ class VLLMLLMService(LLMServiceBase):
         super().__init__(settings)
         self.vllm_settings = getattr(settings, 'vllm', None)
         self.llm_settings = getattr(settings, 'llm', None)
+
+        self.endpoint_url = None
+        self.streaming_enabled = True
+        self.timeout = 600
+        self.model_type = ''
 
         # 초기화 상태 플래그
         self.is_initialized = False

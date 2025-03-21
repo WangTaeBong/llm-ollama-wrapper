@@ -24,8 +24,8 @@ from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_ollama.llms import OllamaLLM
 
-from src.services.core.base import LLMServiceBase
-from src.services.core.factory import LLMServiceFactory
+from .base import LLMServiceBase
+from .factory import LLMServiceFactory
 
 # 로거 설정
 logger = logging.getLogger(__name__)
