@@ -721,20 +721,6 @@ class LlmHistoryHandler:
                 "input": request.chat.user,
             }
 
-            # 이미지 데이터가 있는 경우 추가
-            if hasattr(request.chat, 'image') and request.chat.image:
-                rewrite_context["image_description"] = self._format_image_data(request.chat.image)
-                # 이미지 정보를 프롬프트에 추가
-                if '{image_description}' not in rewrite_prompt_template:
-                    insert_point = rewrite_prompt_template.find('{input}')
-                    if insert_point > 0:
-                        image_instruction = "\n\n사용자가 다음 이미지를 제공했습니다: {image_description}\n\n"
-                        rewrite_prompt_template = (
-                                rewrite_prompt_template[:insert_point] +
-                                image_instruction +
-                                rewrite_prompt_template[insert_point:]
-                        )
-
             rewrite_prompt = rewrite_prompt_template.format(**rewrite_context)
 
             # vLLM에 질문 재정의 요청
@@ -787,12 +773,6 @@ class LlmHistoryHandler:
             "language": language,
             "today": self.response_generator.get_today(),
         }
-
-        # 이미지 데이터가 있는 경우 추가 처리
-        if hasattr(request.chat, 'image') and request.chat.image:
-            final_prompt_context, rag_prompt_template = self.handle_image_for_prompt(
-                final_prompt_context, rag_prompt_template
-            )
 
         # VOC 관련 설정 추가 (필요한 경우)
         if self.request.meta.rag_sys_info == "komico_voc":
@@ -939,20 +919,6 @@ class LlmHistoryHandler:
                 "input": request.chat.user,
             }
 
-            # 이미지 데이터가 있는 경우 추가
-            if hasattr(request.chat, 'image') and request.chat.image:
-                rewrite_context["image_description"] = self._format_image_data(request.chat.image)
-                # 이미지 정보를 프롬프트에 추가
-                if '{image_description}' not in rewrite_prompt_template:
-                    insert_point = rewrite_prompt_template.find('{input}')
-                    if insert_point > 0:
-                        image_instruction = "\n\n사용자가 다음 이미지를 제공했습니다: {image_description}\n\n"
-                        rewrite_prompt_template = (
-                                rewrite_prompt_template[:insert_point] +
-                                image_instruction +
-                                rewrite_prompt_template[insert_point:]
-                        )
-
             rewrite_prompt = rewrite_prompt_template.format(**rewrite_context)
 
             # vLLM에 질문 재정의 요청
@@ -1024,20 +990,6 @@ class LlmHistoryHandler:
             "language": language,
             "today": self.response_generator.get_today(),
         }
-
-        # 이미지 데이터가 있는 경우 추가 처리
-        if hasattr(request.chat, 'image') and request.chat.image:
-            final_prompt_context["image_description"] = self._format_image_data(request.chat.image)
-            # 이미지 정보를 프롬프트에 추가
-            if '{image_description}' not in rag_prompt_template:
-                insert_point = rag_prompt_template.find('{input}')
-                if insert_point > 0:
-                    image_instruction = "\n\n# 이미지 정보\n다음은 사용자가 제공한 이미지에 대한 정보입니다:\n{image_description}\n\n# 질문\n"
-                    rag_prompt_template = (
-                            rag_prompt_template[:insert_point] +
-                            image_instruction +
-                            rag_prompt_template[insert_point:]
-                    )
 
         # VOC 관련 설정 추가 (필요한 경우)
         if request.meta.rag_sys_info == "komico_voc":
@@ -1147,20 +1099,6 @@ class LlmHistoryHandler:
                 "input": request.chat.user,
             }
 
-            # 이미지 데이터가 있는 경우 추가
-            if hasattr(request.chat, 'image') and request.chat.image:
-                rewrite_context["image_description"] = self._format_image_data(request.chat.image)
-                # 이미지 정보를 프롬프트에 추가
-                if '{image_description}' not in rewrite_prompt_template:
-                    insert_point = rewrite_prompt_template.find('{input}')
-                    if insert_point > 0:
-                        image_instruction = "\n\n사용자가 다음 이미지를 제공했습니다: {image_description}\n\n"
-                        rewrite_prompt_template = (
-                                rewrite_prompt_template[:insert_point] +
-                                image_instruction +
-                                rewrite_prompt_template[insert_point:]
-                        )
-
             # Gemma 형식으로 프롬프트 변환
             rewrite_prompt = self.build_system_prompt_gemma(rewrite_prompt_template, rewrite_context)
 
@@ -1199,20 +1137,6 @@ class LlmHistoryHandler:
             "language": language,
             "today": self.response_generator.get_today(),
         }
-
-        # 이미지 데이터가 있는 경우 추가 처리
-        if hasattr(request.chat, 'image') and request.chat.image:
-            final_prompt_context["image_description"] = self._format_image_data(request.chat.image)
-            # 이미지 정보를 프롬프트에 추가
-            if '{image_description}' not in rag_prompt_template:
-                insert_point = rag_prompt_template.find('{input}')
-                if insert_point > 0:
-                    image_instruction = "\n\n# 이미지 정보\n다음은 사용자가 제공한 이미지에 대한 정보입니다:\n{image_description}\n\n# 질문\n"
-                    rag_prompt_template = (
-                            rag_prompt_template[:insert_point] +
-                            image_instruction +
-                            rag_prompt_template[insert_point:]
-                    )
 
         # VOC 관련 설정 추가 (필요한 경우)
         if self.request.meta.rag_sys_info == "komico_voc":
@@ -1597,7 +1521,8 @@ class LlmHistoryHandler:
         logger.debug(f"[{session_id}] 재작성된 질문 검증 통과")
         return rewritten_question
 
-    def _extract_important_entities(self, text):
+    @classmethod
+    def _extract_important_entities(cls, text):
         """
         텍스트에서 중요 엔티티(고유명사, 전문용어 등)를 추출합니다.
         간단한 구현으로, 대문자로 시작하는 단어와 숫자를 포함하는 단어를 추출합니다.
@@ -1608,8 +1533,6 @@ class LlmHistoryHandler:
         Returns:
             list: 추출된 중요 엔티티 목록
         """
-        import re
-
         # 한글 고유명사 추출 패턴 (2글자 이상 연속된 한글)
         korean_entities = re.findall(r'[가-힣]{2,}', text)
 
