@@ -56,7 +56,7 @@ from src.services.llm_history_handler import LlmHistoryHandler
 from src.services.query_processor import QueryProcessor
 from src.services.response_generator import ResponseGenerator
 from src.services.search_engine import SearchEngine
-from src.services.voc_processor import VOCLinkProcessor
+from src.services.voc import VOCLinkProcessor
 from src.utils.redis_utils import RedisUtils
 
 # Load application settings from configuration
@@ -626,29 +626,6 @@ class LLMService:
         session_id = self.request.meta.session_id
 
         try:
-            # 이미지 데이터 처리
-            if (settings.llm.llm_backend.lower() == "vllm" and
-                    hasattr(self.request.chat, 'image') and
-                    self.request.chat.image):
-
-                # 이미지 데이터가 있고 vLLM 백엔드인 경우만 처리
-                image_data = self.request.chat.image
-
-                # 이미지 정보를 프롬프트에 추가
-                if 'image_description' not in context:
-                    context['image_description'] = self._format_image_data(image_data)
-
-                    # 프롬프트 템플릿에 이미지 설명 토큰이 없으면 입력 앞에 추가
-                    if '{image_description}' not in self.system_prompt_template:
-                        insert_point = self.system_prompt_template.find('{input}')
-                        if insert_point > 0:
-                            image_instruction = "\n\n# 이미지 정보\n다음은 사용자가 제공한 이미지에 대한 정보입니다:\n{image_description}\n\n# 질문\n"
-                            self.system_prompt_template = (
-                                    self.system_prompt_template[:insert_point] +
-                                    image_instruction +
-                                    self.system_prompt_template[insert_point:]
-                            )
-
             prompt = self.system_prompt_template.format(**context)
             return prompt
         except KeyError as e:
@@ -673,23 +650,6 @@ class LLMService:
         """
         session_id = self.request.meta.session_id
         try:
-            # 이미지 데이터 처리
-            if hasattr(self.request.chat, 'image') and self.request.chat.image:
-                # 이미지 정보를 프롬프트에 추가
-                if 'image_description' not in context:
-                    context['image_description'] = self._format_image_data(self.request.chat.image)
-
-                    # 프롬프트 템플릿에 이미지 설명 토큰이 없으면 입력 앞에 추가
-                    if '{image_description}' not in self.system_prompt_template:
-                        insert_point = self.system_prompt_template.find('{input}')
-                        if insert_point > 0:
-                            image_instruction = "\n\n# 이미지 정보\n다음은 사용자가 제공한 이미지에 대한 정보입니다:\n{image_description}\n\n# 질문\n"
-                            self.system_prompt_template = (
-                                    self.system_prompt_template[:insert_point] +
-                                    image_instruction +
-                                    self.system_prompt_template[insert_point:]
-                            )
-
             # 먼저 기존 함수로 프롬프트 생성
             raw_prompt = self.build_system_prompt(context)
 
@@ -718,26 +678,6 @@ class LLMService:
             basic_prompt = f"<start_of_turn>user\n다음 질문에 답해주세요: {context.get('input', '질문 없음')}\n<end_of_turn>\n<start_of_turn>model\n"
             return basic_prompt
 
-    @classmethod
-    def _format_image_data(cls, image_data: Dict[str, str]) -> str:
-        """
-        이미지 데이터를 프롬프트에 추가하기 위한 형식으로 변환합니다.
-
-        Args:
-            image_data (Dict[str, str]): 이미지 데이터 (base64, URL 등)
-
-        Returns:
-            str: 포맷된 이미지 정보
-        """
-        # 이미지 데이터 형식에 따라 적절한 설명 생성
-        if 'base64' in image_data:
-            return "[이미지 데이터가 base64 형식으로 전달되었습니다. 이미지를 분석하여 관련 정보를 제공해주세요.]"
-        elif 'url' in image_data:
-            return f"[이미지 URL: {image_data.get('url')}]"
-        elif 'description' in image_data:
-            return f"[이미지 설명: {image_data.get('description')}]"
-        else:
-            return "[이미지 데이터가 제공되었습니다. 이미지를 분석하여 관련 정보를 제공해주세요.]"
 
     @async_retry(max_retries=2, backoff_factor=2, circuit_breaker=_vllm_circuit_breaker)
     async def call_vllm_endpoint(self, data: VllmInquery):
@@ -1061,10 +1001,6 @@ class LLMService:
             "language": language,
             "today": self.response_generator.get_today(),
         }
-
-        # 이미지 데이터가 있는 경우 추가
-        if hasattr(self.request.chat, 'image') and self.request.chat.image:
-            context["image_description"] = self._format_image_data(self.request.chat.image)
 
         # Add VOC related context if needed
         if self.request.meta.rag_sys_info == "komico_voc":
@@ -1657,20 +1593,6 @@ class ChatService:
                     "today": self.response_generator.get_today(),
                 }
 
-                # 이미지 데이터가 있는 경우 추가
-                if hasattr(self.request.chat, 'image') and self.request.chat.image:
-                    # 이미지 정보를 포맷팅하여 컨텍스트에 추가
-                    if hasattr(self.llm_service, '_format_image_data'):
-                        context["image_description"] = self.llm_service._format_image_data(self.request.chat.image)
-                    else:
-                        # llm_service에 해당 메서드가 없을 경우 간단한 설명 생성
-                        if 'base64' in self.request.chat.image:
-                            context["image_description"] = "[이미지 데이터가 base64 형식으로 전달되었습니다. 이미지를 분석하여 관련 정보를 제공해주세요.]"
-                        elif 'url' in self.request.chat.image:
-                            context["image_description"] = f"[이미지 URL: {self.request.chat.image.get('url')}]"
-                        else:
-                            context["image_description"] = "[이미지 데이터가 제공되었습니다. 이미지를 분석하여 관련 정보를 제공해주세요.]"
-
                 # VOC 관련 설정 추가
                 if self.request.meta.rag_sys_info == "komico_voc":
                     context.update({
@@ -1679,20 +1601,6 @@ class ChatService:
                         "check_gw_word": settings.voc.check_gw_word,
                         "check_block_line": settings.voc.check_block_line,
                     })
-
-                # 시스템 프롬프트 생성
-                system_prompt_template = self.llm_service._initialize_system_prompt_vllm()
-
-                # 이미지 정보가 있고 시스템 프롬프트에 관련 토큰이 없으면 추가
-                if "image_description" in context and "{image_description}" not in system_prompt_template:
-                    insert_point = system_prompt_template.find("{input}")
-                    if insert_point > 0:
-                        image_instruction = "\n\n# 이미지 정보\n다음은 사용자가 제공한 이미지에 대한 정보입니다:\n{image_description}\n\n# 질문\n"
-                        system_prompt_template = (
-                                system_prompt_template[:insert_point] +
-                                image_instruction +
-                                system_prompt_template[insert_point:]
-                        )
 
                 # 시스템 프롬프트 생성
                 vllm_inquery_context = self.llm_service.build_system_prompt(context)
@@ -2209,7 +2117,7 @@ class ChatService:
             if "komico_voc" in settings.voc.voc_type.split(',') and self.request.meta.rag_sys_info == "komico_voc":
                 start_time = time.time()
                 result = await asyncio.to_thread(
-                    self.voc_processor.make_komico_voc_groupware_docid_url,
+                    self.voc_processor.process_voc_document_links,
                     query_answer
                 )
                 await self._log(
@@ -2535,7 +2443,7 @@ class StreamResponsePostProcessor:
             # 2. VOC 처리
             if "komico_voc" in settings.voc.voc_type.split(',') and self.request.meta.rag_sys_info == "komico_voc":
                 processed_text = await asyncio.to_thread(
-                    self.voc_processor.make_komico_voc_groupware_docid_url,
+                    self.voc_processor.process_voc_document_links,
                     processed_text
                 )
 

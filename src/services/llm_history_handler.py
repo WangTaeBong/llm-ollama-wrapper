@@ -355,59 +355,6 @@ class LlmHistoryHandler:
         return unique_messages
 
     @classmethod
-    def _format_image_data(cls, image_data: Dict[str, str]) -> str:
-        """
-        이미지 데이터를 프롬프트에 추가하기 위한 형식으로 변환합니다.
-
-        Args:
-            image_data (Dict[str, str]): 이미지 데이터 (base64, URL 등)
-
-        Returns:
-            str: 포맷된 이미지 정보
-        """
-        # 이미지 데이터 형식에 따라 적절한 설명 생성
-        if 'base64' in image_data:
-            return "[이미지 데이터가 base64 형식으로 전달되었습니다. 이미지를 분석하여 관련 정보를 제공해주세요.]"
-        elif 'url' in image_data:
-            return f"[이미지 URL: {image_data.get('url')}]"
-        elif 'description' in image_data:
-            return f"[이미지 설명: {image_data.get('description')}]"
-        else:
-            return "[이미지 데이터가 제공되었습니다. 이미지를 분석하여 관련 정보를 제공해주세요.]"
-
-    def handle_image_for_prompt(self, context: Dict[str, Any], prompt_template: str) -> Tuple[Dict[str, Any], str]:
-        """
-        이미지 정보를 컨텍스트에 추가하고 필요 시 프롬프트 템플릿 수정
-
-        Args:
-            context (Dict[str, Any]): 현재 컨텍스트
-            prompt_template (str): 현재 프롬프트 템플릿
-
-        Returns:
-            Tuple[Dict[str, Any], str]: 업데이트된 (컨텍스트, 프롬프트 템플릿)
-        """
-        # 이미지 데이터 처리
-        if (hasattr(self.request.chat, 'image') and
-                self.request.chat.image and
-                settings.llm.llm_backend.lower() == "vllm"):
-
-            # 컨텍스트에 이미지 정보 추가
-            context['image_description'] = self._format_image_data(self.request.chat.image)
-
-            # 프롬프트 템플릿에 이미지 토큰이 없으면 추가
-            if '{image_description}' not in prompt_template:
-                insert_point = prompt_template.find('{input}')
-                if insert_point > 0:
-                    image_instruction = "\n\n# 이미지 정보\n다음은 사용자가 제공한 이미지에 대한 정보입니다:\n{image_description}\n\n# 질문\n"
-                    prompt_template = (
-                            prompt_template[:insert_point] +
-                            image_instruction +
-                            prompt_template[insert_point:]
-                    )
-
-        return context, prompt_template
-
-    @classmethod
     def format_history_for_prompt(cls, session_history: ChatMessageHistory, max_turns: int = 5) -> str:
         """
         형식화된 대화 이력을 생성합니다.
