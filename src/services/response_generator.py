@@ -241,6 +241,10 @@ class ResponseGenerator:
         reference_pattern = rf"---------\s*\n{re.escape(reference_word)}"
         existing_references_match = re.search(reference_pattern, query_answer)
 
+        # 먼저 문서 참조 패턴이 응답에 포함되어 있는지 확인하고 제거
+        doc_reference_pattern = r"\(\[Document\(metadata=\{.*?\}\s*,\s*…\)\]\)"
+        query_answer = re.sub(doc_reference_pattern, "", query_answer)
+
         # Return original if no answer or no reference documents
         if not query_answer or not retriever_documents:
             return query_answer

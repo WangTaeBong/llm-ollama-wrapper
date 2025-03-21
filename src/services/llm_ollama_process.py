@@ -2172,6 +2172,10 @@ class ChatService:
         """
         session_id = self.request.meta.session_id
 
+        # 문서 참조 패턴 제거
+        doc_reference_pattern = r"\(\[Document\(metadata=\{.*?\}\s*,\s*…\)\]\)"
+        query_answer = re.sub(doc_reference_pattern, "", query_answer)
+
         try:
             # Add source references
             if settings.prompt.source_count:
