@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 from functools import lru_cache
 from time import localtime
@@ -236,10 +237,9 @@ class ResponseGenerator:
         Returns:
             str: Answer text with added reference information
         """
-        # 이미 참고문헌이 있는지 확인
-        if reference_word in query_answer:
-            logger.debug(f"References already exist in the answer, skipping addition")
-            return query_answer
+        # 참고문헌 섹션이 이미 존재하는지 확인
+        reference_pattern = rf"---------\s*\n{re.escape(reference_word)}"
+        existing_references_match = re.search(reference_pattern, query_answer)
 
         # Return original if no answer or no reference documents
         if not query_answer or not retriever_documents:
@@ -253,11 +253,21 @@ class ResponseGenerator:
         try:
             # Collect deduplicated document source information
             docs_source: Dict[str, Dict[str, any]] = {}
+            wiki_ko_docs_count = 0
+            total_docs_count = 0
+
             for doc in retriever_documents:
+                total_docs_count += 1
+
                 # Extract document name and page
                 doc_name = doc.metadata.get("doc_name") or doc.metadata.get("source", "Unknown Document")
                 if isinstance(doc_name, str) and "," in doc_name:
                     doc_name = doc_name.split(",")[0].strip()
+
+                # wiki_ko 문서 필터링
+                if isinstance(doc_name, str) and "wiki_ko" in doc_name:
+                    wiki_ko_docs_count += 1
+                    continue  # wiki_ko 문서는 출처에 포함하지 않음
 
                 doc_page = doc.metadata.get("doc_page", "N/A")
 
@@ -290,64 +300,110 @@ class ResponseGenerator:
                         "is_web": is_web_result
                     }
 
-            # Add reference information
-            if docs_source:
-                # Maximum number of sources to display (from settings or default)
-                max_sources = min(
-                    getattr(self.settings.prompt, 'source_count', len(docs_source)),
-                    len(docs_source)
-                )
+            # 모든 문서가 wiki_ko인 경우 참조 정보를 추가하지 않음
+            if wiki_ko_docs_count == total_docs_count or not docs_source:
+                return query_answer
 
-                # Separate web results and RAG results
-                web_results = []
-                rag_results = []
+            # 이미 참고문헌이 있는 경우
+            if existing_references_match:
+                # 기존 참고문헌 섹션 추출
+                existing_section = query_answer[existing_references_match.start():]
 
+                # 기존 참고문헌에 포함된 문서명 추출
+                existing_docs = set()
+                for line in existing_section.split('\n'):
+                    if line.startswith('- '):
+                        doc_match = re.match(r'- ([^(]+)', line)
+                        if doc_match:
+                            existing_docs.add(doc_match.group(1).strip())
+
+                # 새로운 문서만 추가
+                new_entries = []
                 for doc_name, data in docs_source.items():
-                    if data["is_web"]:
-                        web_results.append((doc_name, data["page"]))
-                    else:
-                        rag_results.append((doc_name, data["page"]))
+                    if doc_name not in existing_docs:
+                        if data["is_web"]:
+                            # 웹 문서 처리
+                            if data["page"].startswith("http"):
+                                new_entries.append(
+                                    f"- {doc_name} (<a href=\"{data['page']}\" target=\"_blank\">Link</a>)")
+                            else:
+                                new_entries.append(f"- {doc_name} (Link: {data['page']})")
+                        else:
+                            new_entries.append(f"- {doc_name} (Page: {data['page']})")
 
-                # Create reference section
-                reference_section = f"\n\n---------\n{reference_word}"
+                # 새 문서가 있을 경우에만 추가
+                if new_entries:
+                    # 참고문헌 섹션의 끝을 찾아 새 항목 추가
+                    lines = query_answer.split('\n')
+                    ref_start_idx = None
+                    for i, line in enumerate(lines):
+                        if reference_word in line:
+                            ref_start_idx = i
+                            break
 
-                # Add RAG results first
-                for i, (doc_name, doc_page) in enumerate(rag_results):
+                    if ref_start_idx is not None:
+                        # 참고문헌 섹션에 새 항목 추가
+                        updated_lines = lines[:ref_start_idx + 1] + new_entries + lines[ref_start_idx + 1:]
+                        return '\n'.join(updated_lines)
+
+                # 새 문서가 없으면 원본 반환
+                return query_answer
+
+            # 참고문헌이 없는 경우 새 참고문헌 섹션 생성
+            # Maximum number of sources to display (from settings or default)
+            max_sources = min(
+                getattr(self.settings.prompt, 'source_count', len(docs_source)),
+                len(docs_source)
+            )
+
+            # Separate web results and RAG results
+            web_results = []
+            rag_results = []
+
+            for doc_name, data in docs_source.items():
+                if data["is_web"]:
+                    web_results.append((doc_name, data["page"]))
+                else:
+                    rag_results.append((doc_name, data["page"]))
+
+            # Create reference section
+            reference_section = f"\n\n---------\n{reference_word}"
+
+            # Add RAG results first
+            for i, (doc_name, doc_page) in enumerate(rag_results):
+                if i >= max_sources:
+                    break
+                reference_section += f"\n- {doc_name} (Page: {doc_page})"
+
+            # Add Web results with "Link" word that has hyperlink
+            web_search_enabled = hasattr(self.settings, 'web_search') and getattr(self.settings.web_search,
+                                                                                  'use_flag', False)
+            if web_search_enabled:
+                for i, (doc_name, url) in enumerate(web_results):
                     if i >= max_sources:
                         break
-                    reference_section += f"\n- {doc_name} (Page: {doc_page})"
+                    # Check if we're dealing with a valid URL
+                    if url and (url.startswith("http://") or url.startswith("https://")):
+                        # Directly create the HTML link without markers
+                        reference_section += f"\n- {doc_name} (<a href=\"{url}\" target=\"_blank\">Link</a>)"
+                    else:
+                        # Fallback for invalid URLs
+                        reference_section += f"\n- {doc_name} (Link: {url})"
+            else:
+                # If web search is disabled, still show the results
+                for i, (doc_name, url) in enumerate(web_results):
+                    if i >= max_sources:
+                        break
+                    reference_section += f"\n- {doc_name} (URL: {url})"
 
-                # Add Web results with "Link" word that has hyperlink
-                web_search_enabled = hasattr(self.settings, 'web_search') and getattr(self.settings.web_search,
-                                                                                      'use_flag', False)
-                if web_search_enabled:
-                    for i, (doc_name, url) in enumerate(web_results):
-                        if i >= max_sources:
-                            break
-                        # Check if we're dealing with a valid URL
-                        if url and (url.startswith("http://") or url.startswith("https://")):
-                            # Directly create the HTML link without markers
-                            reference_section += f"\n- {doc_name} (<a href=\"{url}\" target=\"_blank\">Link</a>)"
-                        else:
-                            # Fallback for invalid URLs
-                            reference_section += f"\n- {doc_name} (Link: {url})"
-                else:
-                    # If web search is disabled, still show the results
-                    for i, (doc_name, url) in enumerate(web_results):
-                        if i >= max_sources:
-                            break
-                        reference_section += f"\n- {doc_name} (URL: {url})"
+            # Add reference section to original answer
+            query_answer += reference_section
 
-                # Add reference section to original answer
-                query_answer += reference_section
-
-                # HTML 링크는 이미 직접 삽입되었으므로 추가 처리가 필요하지 않음
-
-                # Log important information
-                if len(docs_source) > 0:
-                    log_with_session_id(logger.debug,
-                                        f"{len(docs_source)} reference documents ({len(web_results)} web, {len(rag_results)} RAG) added to the answer",
-                                        request)
+            # Log important information
+            if len(docs_source) > 0:
+                log_with_session_id(logger.debug,
+                                    f"{len(docs_source)} reference documents ({len(web_results)} web, {len(rag_results)} RAG) added to the answer",
+                                    request)
 
             return query_answer
 

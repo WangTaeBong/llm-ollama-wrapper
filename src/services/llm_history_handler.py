@@ -752,7 +752,19 @@ class LlmHistoryHandler:
                 logger.warning(f"[{self.current_session_id}] 질문 재정의 실패, 원래 질문 사용")
                 rewritten_question = request.chat.user
             else:
-                logger.debug(f"[{self.current_session_id}] 질문 재정의 성공: '{rewritten_question}'")
+                # 질문 재정의 후 검증 추가
+                if rewritten_question:
+                    # 원본 질문에서 중요 엔티티 추출
+                    important_entities = self._extract_important_entities(request.chat.user)
+
+                    # 재작성된 질문 검증
+                    rewritten_question = self.validate_rewritten_question(
+                        request.chat.user,
+                        rewritten_question,
+                        important_entities
+                    )
+
+                    logger.debug(f"[{self.current_session_id}] 최종 재정의 사용 질문: '{rewritten_question}'")
 
         # 2단계: 재정의된 질문으로 문서 검색
         logger.debug(f"[{self.current_session_id}] 재정의된 질문으로 문서 검색 시작")
@@ -961,7 +973,19 @@ class LlmHistoryHandler:
                     logger.warning(f"[{session_id}] 질문 재정의 실패, 원래 질문 사용")
                     rewritten_question = request.chat.user
                 else:
-                    logger.debug(f"[{session_id}] 질문 재정의 성공: '{rewritten_question}'")
+                    # 질문 재정의 후 검증 추가
+                    if rewritten_question:
+                        # 원본 질문에서 중요 엔티티 추출
+                        important_entities = self._extract_important_entities(request.chat.user)
+
+                        # 재작성된 질문 검증
+                        rewritten_question = self.validate_rewritten_question(
+                            request.chat.user,
+                            rewritten_question,
+                            important_entities
+                        )
+
+                        logger.debug(f"[{session_id}] 최종 재정의 사용 질문: '{rewritten_question}'")
             except asyncio.TimeoutError:
                 logger.warning(f"[{session_id}] 질문 재정의 타임아웃, 원래 질문 사용")
                 rewritten_question = request.chat.user
@@ -1273,7 +1297,19 @@ class LlmHistoryHandler:
                     logger.warning(f"[{session_id}] 질문 재정의 실패, 원래 질문 사용")
                     rewritten_question = request.chat.user
                 else:
-                    logger.debug(f"[{session_id}] 질문 재정의 성공: '{rewritten_question}'")
+                    # 질문 재정의 후 검증 추가
+                    if rewritten_question:
+                        # 원본 질문에서 중요 엔티티 추출
+                        important_entities = self._extract_important_entities(request.chat.user)
+
+                        # 재작성된 질문 검증
+                        rewritten_question = self.validate_rewritten_question(
+                            request.chat.user,
+                            rewritten_question,
+                            important_entities
+                        )
+
+                        logger.debug(f"[{self.current_session_id}] 최종 재정의 사용 질문: '{rewritten_question}'")
             except asyncio.TimeoutError:
                 logger.warning(f"[{session_id}] 질문 재정의 타임아웃, 원래 질문 사용")
                 rewritten_question = request.chat.user
@@ -1505,3 +1541,84 @@ class LlmHistoryHandler:
         if len(self.processed_inputs) > 100:
             logger.warning(f"[{self.current_session_id}] 처리된 입력이 많습니다. 캐시 정리 진행")
             self.processed_inputs.clear()
+
+    def validate_rewritten_question(self, original_question, rewritten_question, important_entities=None):
+        """
+        재작성된 질문의 품질을 검증하고 적합하지 않을 경우 원본 질문을 반환합니다.
+
+        Args:
+            original_question (str): 원본 질문
+            rewritten_question (str): 재작성된 질문
+            important_entities (list, optional): 보존해야 할 중요 엔티티 목록
+
+        Returns:
+            str: 검증을 통과한 재작성 질문 또는 원본 질문
+        """
+        # 중요 엔티티가 지정되지 않은 경우, 원본 질문에서 추출
+        if important_entities is None:
+            important_entities = self._extract_important_entities(original_question)
+
+        # 1. 핵심 엔티티 보존 검증
+        entities_preserved = all(entity in rewritten_question for entity in important_entities)
+
+        # 2. 의미적 일관성 검증 (간소화된 버전)
+        # 정교한 임베딩 비교는 추가 라이브러리가 필요하므로, 간단한 단어 중복 기반 유사도 사용
+        original_words = set(original_question.lower().split())
+        rewritten_words = set(rewritten_question.lower().split())
+        word_overlap = len(original_words.intersection(rewritten_words)) / max(len(original_words), 1)
+
+        # 3. 길이 및 복잡성 검증
+        length_ratio = len(rewritten_question) / max(len(original_question), 1)
+        length_appropriate = 0.7 <= length_ratio <= 2.5
+
+        # 로깅
+        session_id = getattr(self, 'current_session_id', 'unknown')
+        logger.debug(f"[{session_id}] 질문 재작성 검증: 엔티티 보존={entities_preserved}, "
+                     f"단어 유사도={word_overlap:.2f}, 길이 비율={length_ratio:.2f}")
+
+        # 판단 로직
+        if not entities_preserved:
+            logger.warning(f"[{session_id}] 엔티티 보존 실패로 원본 질문 사용")
+            return original_question
+
+        if word_overlap < 0.4:  # 단어 기반 유사도 임계값
+            logger.warning(f"[{session_id}] 의미 유사도 낮음으로 원본 질문 사용")
+            return original_question
+
+        if not length_appropriate:
+            logger.warning(f"[{session_id}] 길이 비율 부적절로 원본 질문 사용")
+            return original_question
+
+        logger.debug(f"[{session_id}] 재작성된 질문 검증 통과")
+        return rewritten_question
+
+    def _extract_important_entities(self, text):
+        """
+        텍스트에서 중요 엔티티(고유명사, 전문용어 등)를 추출합니다.
+        간단한 구현으로, 대문자로 시작하는 단어와 숫자를 포함하는 단어를 추출합니다.
+
+        Args:
+            text (str): 분석할 텍스트
+
+        Returns:
+            list: 추출된 중요 엔티티 목록
+        """
+        import re
+
+        # 한글 고유명사 추출 패턴 (2글자 이상 연속된 한글)
+        korean_entities = re.findall(r'[가-힣]{2,}', text)
+
+        # 영문 대문자로 시작하는 단어 추출
+        capitalized_words = re.findall(r'\b[A-Z][a-zA-Z]*\b', text)
+
+        # 숫자가 포함된 단어 추출
+        numeric_entities = re.findall(r'\b\w*\d+\w*\b', text)
+
+        # 결과 결합 및 중복 제거
+        entities = list(set(korean_entities + capitalized_words + numeric_entities))
+
+        # 불용어 제거 (필요시 확장)
+        stopwords = ['그것', '이것', '저것', '그', '이', '저', '그런', '이런', '저런']
+        entities = [e for e in entities if e not in stopwords]
+
+        return entities
