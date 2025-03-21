@@ -81,6 +81,12 @@ class PayloadReq(BaseModel):
         return value.strip()
 
 
+class ImageData(BaseModel):
+    filename: Optional[str] = None
+    data: Optional[str] = None
+    mime_type: Optional[str] = None
+
+
 class ChatReq(BaseModel):
     """
     Represents a chat request within the document management system.
@@ -95,6 +101,7 @@ class ChatReq(BaseModel):
         category2 (Optional[str]): Secondary categorization label (optional).
         category3 (Optional[str]): Tertiary categorization label (optional).
         payload (List[PayloadReq]): List of document payloads. Defaults to empty list.
+        image Optional[ImageData]: Image data. (optional)
     """
     lang: str = Field(default="ko", description="Language code, defaults to Korean")
     user: str = Field(..., description="User identifier")
@@ -103,7 +110,7 @@ class ChatReq(BaseModel):
     category3: Optional[str] = Field(default=None, description="Tertiary category")
     payload: List[PayloadReq] = Field(default_factory=list, description="Document payloads")
     # 이미지 처리를 위한 새로운 필드 추가
-    image: Optional[Dict[str, str]] = Field(default=None, description="Image data")
+    image: Optional[ImageData] = Field(default=None, description="Image data")
 
     @classmethod
     @field_validator("payload", mode="before")

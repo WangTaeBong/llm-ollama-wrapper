@@ -355,6 +355,59 @@ class LlmHistoryHandler:
         return unique_messages
 
     @classmethod
+    def _format_image_data(cls, image_data: Dict[str, str]) -> str:
+        """
+        이미지 데이터를 프롬프트에 추가하기 위한 형식으로 변환합니다.
+
+        Args:
+            image_data (Dict[str, str]): 이미지 데이터 (base64, URL 등)
+
+        Returns:
+            str: 포맷된 이미지 정보
+        """
+        # 이미지 데이터 형식에 따라 적절한 설명 생성
+        if 'base64' in image_data:
+            return "[이미지 데이터가 base64 형식으로 전달되었습니다. 이미지를 분석하여 관련 정보를 제공해주세요.]"
+        elif 'url' in image_data:
+            return f"[이미지 URL: {image_data.get('url')}]"
+        elif 'description' in image_data:
+            return f"[이미지 설명: {image_data.get('description')}]"
+        else:
+            return "[이미지 데이터가 제공되었습니다. 이미지를 분석하여 관련 정보를 제공해주세요.]"
+
+    def handle_image_for_prompt(self, context: Dict[str, Any], prompt_template: str) -> Tuple[Dict[str, Any], str]:
+        """
+        이미지 정보를 컨텍스트에 추가하고 필요 시 프롬프트 템플릿 수정
+
+        Args:
+            context (Dict[str, Any]): 현재 컨텍스트
+            prompt_template (str): 현재 프롬프트 템플릿
+
+        Returns:
+            Tuple[Dict[str, Any], str]: 업데이트된 (컨텍스트, 프롬프트 템플릿)
+        """
+        # 이미지 데이터 처리
+        if (hasattr(self.request.chat, 'image') and
+                self.request.chat.image and
+                settings.llm.llm_backend.lower() == "vllm"):
+
+            # 컨텍스트에 이미지 정보 추가
+            context['image_description'] = self._format_image_data(self.request.chat.image)
+
+            # 프롬프트 템플릿에 이미지 토큰이 없으면 추가
+            if '{image_description}' not in prompt_template:
+                insert_point = prompt_template.find('{input}')
+                if insert_point > 0:
+                    image_instruction = "\n\n# 이미지 정보\n다음은 사용자가 제공한 이미지에 대한 정보입니다:\n{image_description}\n\n# 질문\n"
+                    prompt_template = (
+                            prompt_template[:insert_point] +
+                            image_instruction +
+                            prompt_template[insert_point:]
+                    )
+
+        return context, prompt_template
+
+    @classmethod
     def format_history_for_prompt(cls, session_history: ChatMessageHistory, max_turns: int = 5) -> str:
         """
         형식화된 대화 이력을 생성합니다.
@@ -668,6 +721,20 @@ class LlmHistoryHandler:
                 "input": request.chat.user,
             }
 
+            # 이미지 데이터가 있는 경우 추가
+            if hasattr(request.chat, 'image') and request.chat.image:
+                rewrite_context["image_description"] = self._format_image_data(request.chat.image)
+                # 이미지 정보를 프롬프트에 추가
+                if '{image_description}' not in rewrite_prompt_template:
+                    insert_point = rewrite_prompt_template.find('{input}')
+                    if insert_point > 0:
+                        image_instruction = "\n\n사용자가 다음 이미지를 제공했습니다: {image_description}\n\n"
+                        rewrite_prompt_template = (
+                                rewrite_prompt_template[:insert_point] +
+                                image_instruction +
+                                rewrite_prompt_template[insert_point:]
+                        )
+
             rewrite_prompt = rewrite_prompt_template.format(**rewrite_context)
 
             # vLLM에 질문 재정의 요청
@@ -705,6 +772,12 @@ class LlmHistoryHandler:
             "language": language,
             "today": self.response_generator.get_today(),
         }
+
+        # 이미지 데이터가 있는 경우 추가 처리
+        if hasattr(request.chat, 'image') and request.chat.image:
+            final_prompt_context, rag_prompt_template = self.handle_image_for_prompt(
+                final_prompt_context, rag_prompt_template
+            )
 
         # VOC 관련 설정 추가 (필요한 경우)
         if self.request.meta.rag_sys_info == "komico_voc":
@@ -851,6 +924,20 @@ class LlmHistoryHandler:
                 "input": request.chat.user,
             }
 
+            # 이미지 데이터가 있는 경우 추가
+            if hasattr(request.chat, 'image') and request.chat.image:
+                rewrite_context["image_description"] = self._format_image_data(request.chat.image)
+                # 이미지 정보를 프롬프트에 추가
+                if '{image_description}' not in rewrite_prompt_template:
+                    insert_point = rewrite_prompt_template.find('{input}')
+                    if insert_point > 0:
+                        image_instruction = "\n\n사용자가 다음 이미지를 제공했습니다: {image_description}\n\n"
+                        rewrite_prompt_template = (
+                                rewrite_prompt_template[:insert_point] +
+                                image_instruction +
+                                rewrite_prompt_template[insert_point:]
+                        )
+
             rewrite_prompt = rewrite_prompt_template.format(**rewrite_context)
 
             # vLLM에 질문 재정의 요청
@@ -909,6 +996,20 @@ class LlmHistoryHandler:
             "language": language,
             "today": self.response_generator.get_today(),
         }
+
+        # 이미지 데이터가 있는 경우 추가 처리
+        if hasattr(request.chat, 'image') and request.chat.image:
+            final_prompt_context["image_description"] = self._format_image_data(request.chat.image)
+            # 이미지 정보를 프롬프트에 추가
+            if '{image_description}' not in rag_prompt_template:
+                insert_point = rag_prompt_template.find('{input}')
+                if insert_point > 0:
+                    image_instruction = "\n\n# 이미지 정보\n다음은 사용자가 제공한 이미지에 대한 정보입니다:\n{image_description}\n\n# 질문\n"
+                    rag_prompt_template = (
+                            rag_prompt_template[:insert_point] +
+                            image_instruction +
+                            rag_prompt_template[insert_point:]
+                    )
 
         # VOC 관련 설정 추가 (필요한 경우)
         if request.meta.rag_sys_info == "komico_voc":
@@ -1018,6 +1119,20 @@ class LlmHistoryHandler:
                 "input": request.chat.user,
             }
 
+            # 이미지 데이터가 있는 경우 추가
+            if hasattr(request.chat, 'image') and request.chat.image:
+                rewrite_context["image_description"] = self._format_image_data(request.chat.image)
+                # 이미지 정보를 프롬프트에 추가
+                if '{image_description}' not in rewrite_prompt_template:
+                    insert_point = rewrite_prompt_template.find('{input}')
+                    if insert_point > 0:
+                        image_instruction = "\n\n사용자가 다음 이미지를 제공했습니다: {image_description}\n\n"
+                        rewrite_prompt_template = (
+                                rewrite_prompt_template[:insert_point] +
+                                image_instruction +
+                                rewrite_prompt_template[insert_point:]
+                        )
+
             # Gemma 형식으로 프롬프트 변환
             rewrite_prompt = self.build_system_prompt_gemma(rewrite_prompt_template, rewrite_context)
 
@@ -1056,6 +1171,20 @@ class LlmHistoryHandler:
             "language": language,
             "today": self.response_generator.get_today(),
         }
+
+        # 이미지 데이터가 있는 경우 추가 처리
+        if hasattr(request.chat, 'image') and request.chat.image:
+            final_prompt_context["image_description"] = self._format_image_data(request.chat.image)
+            # 이미지 정보를 프롬프트에 추가
+            if '{image_description}' not in rag_prompt_template:
+                insert_point = rag_prompt_template.find('{input}')
+                if insert_point > 0:
+                    image_instruction = "\n\n# 이미지 정보\n다음은 사용자가 제공한 이미지에 대한 정보입니다:\n{image_description}\n\n# 질문\n"
+                    rag_prompt_template = (
+                            rag_prompt_template[:insert_point] +
+                            image_instruction +
+                            rag_prompt_template[insert_point:]
+                    )
 
         # VOC 관련 설정 추가 (필요한 경우)
         if self.request.meta.rag_sys_info == "komico_voc":
@@ -1191,7 +1320,7 @@ class LlmHistoryHandler:
 
         # 최종 시스템 프롬프트 생성 (Gemma 형식)
         vllm_inquery_context = self.build_system_prompt_gemma(rag_prompt_template, final_prompt_context)
-        logger.debug(f"[{session_id}] Gemma prompt: {vllm_inquery_context}")
+        # logger.debug(f"[{session_id}] Gemma prompt: {vllm_inquery_context}")
 
         # 스트리밍을 위한 vLLM 요청 생성
         vllm_request = VllmInquery(

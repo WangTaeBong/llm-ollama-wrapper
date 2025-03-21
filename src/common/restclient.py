@@ -307,7 +307,7 @@ class RestClient:
             session_id = body_data.get('meta', {}).get('session_id', 'unknown_session')
             # If the value is 'unknown_session', try an alternative path
             if session_id == 'unknown_session':
-                session_id = body_data.get('session_id', 'still_unknown')
+                session_id = body_data.get('request_id', 'still_unknown')
 
             # Log the request with truncated body for debugging (ensures non-ASCII characters display correctly)
             logger.debug(f"[{session_id}] Sending request to {url} with body: "
