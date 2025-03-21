@@ -752,6 +752,8 @@ class LlmHistoryHandler:
                 logger.warning(f"[{self.current_session_id}] 질문 재정의 실패, 원래 질문 사용")
                 rewritten_question = request.chat.user
             else:
+                logger.debug(f"[{self.current_session_id}] 최종 재정의 사용 질문: '{rewritten_question}'")
+                """
                 # 질문 재정의 후 검증 추가
                 if rewritten_question:
                     # 원본 질문에서 중요 엔티티 추출
@@ -765,6 +767,7 @@ class LlmHistoryHandler:
                     )
 
                     logger.debug(f"[{self.current_session_id}] 최종 재정의 사용 질문: '{rewritten_question}'")
+                """
 
         # 2단계: 재정의된 질문으로 문서 검색
         logger.debug(f"[{self.current_session_id}] 재정의된 질문으로 문서 검색 시작")
@@ -973,6 +976,8 @@ class LlmHistoryHandler:
                     logger.warning(f"[{session_id}] 질문 재정의 실패, 원래 질문 사용")
                     rewritten_question = request.chat.user
                 else:
+                    logger.debug(f"[{session_id}] 최종 재정의 사용 질문: '{rewritten_question}'")
+                    """
                     # 질문 재정의 후 검증 추가
                     if rewritten_question:
                         # 원본 질문에서 중요 엔티티 추출
@@ -984,8 +989,7 @@ class LlmHistoryHandler:
                             rewritten_question,
                             important_entities
                         )
-
-                        logger.debug(f"[{session_id}] 최종 재정의 사용 질문: '{rewritten_question}'")
+                    """
             except asyncio.TimeoutError:
                 logger.warning(f"[{session_id}] 질문 재정의 타임아웃, 원래 질문 사용")
                 rewritten_question = request.chat.user
@@ -1299,6 +1303,8 @@ class LlmHistoryHandler:
                 else:
                     # 질문 재정의 후 검증 추가
                     if rewritten_question:
+                        logger.debug(f"[{session_id}] 최종 재정의 사용 질문: '{rewritten_question}'")
+                        """
                         # 원본 질문에서 중요 엔티티 추출
                         important_entities = self._extract_important_entities(request.chat.user)
 
@@ -1308,8 +1314,7 @@ class LlmHistoryHandler:
                             rewritten_question,
                             important_entities
                         )
-
-                        logger.debug(f"[{self.current_session_id}] 최종 재정의 사용 질문: '{rewritten_question}'")
+                    """
             except asyncio.TimeoutError:
                 logger.warning(f"[{session_id}] 질문 재정의 타임아웃, 원래 질문 사용")
                 rewritten_question = request.chat.user
