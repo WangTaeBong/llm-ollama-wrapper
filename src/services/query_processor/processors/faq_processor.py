@@ -8,6 +8,7 @@ import logging
 from typing import Set, List
 
 from src.services.query_processor.base import QueryProcessorBase
+from src.services.query_processor.cache_manager import QueryCache
 
 # 로거 설정
 logger = logging.getLogger(__name__)
@@ -30,39 +31,17 @@ class FAQQueryProcessor(QueryProcessorBase):
         """
         super().__init__(settings, query_check_json_dict)
 
+        # 캐시 인스턴스 가져오기
+        self.cache = QueryCache.get_instance()
+
         # 자주 사용되는 데이터 캐싱
-        self._faq_category_rag_targets: List[str] = self.settings.prompt.faq_type.split(',')
+        self._faq_category_rag_targets: List[str] = self.get_cached_setting(
+            'prompt.faq_type', ''
+        ).split(',')
+
         self._excluded_categories: Set[str] = {"담당자 메일 문의", "AI 직접 질문", "챗봇 문의"}
 
-        logger.debug("FAQ 쿼리 프로세서가 초기화되었습니다")
-
-    def clean_query(self, query: str) -> str:
-        """
-        FAQ 컨텍스트에 맞게 쿼리를 정제합니다.
-
-        Args:
-            query (str): 정제할 원본 쿼리
-
-        Returns:
-            str: 정제된 쿼리
-        """
-        if not query:
-            return ""
-        # FAQ에 맞는 정제 로직 적용
-        return query.strip()
-
-    def filter_query(self, query: str) -> str:
-        """
-        FAQ 컨텍스트에 맞게 쿼리를 필터링합니다.
-        FAQ는 원본 텍스트를 최대한 보존합니다.
-
-        Args:
-            query (str): 필터링할 원본 쿼리
-
-        Returns:
-            str: 필터링된 쿼리 (FAQ의 경우 대부분 원본 유지)
-        """
-        return query
+        # logger.debug("FAQ 쿼리 프로세서가 초기화되었습니다")
 
     def construct_faq_query(self, request) -> str:
         """
@@ -74,6 +53,14 @@ class FAQQueryProcessor(QueryProcessorBase):
         Returns:
             str: 구성된 FAQ 쿼리 또는 원본 쿼리
         """
+        # 캐시 키 생성
+        cache_key = f"faq:{request.meta.session_id}:{request.chat.user}"
+
+        # 캐시에서 결과 확인
+        cached_result = self.cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result
+
         # RAG 시스템 정보가 FAQ 유형에 해당하는지 확인
         if request.meta.rag_sys_info not in self._faq_category_rag_targets:
             return request.chat.user
@@ -94,6 +81,9 @@ class FAQQueryProcessor(QueryProcessorBase):
 
         # 원본 쿼리와 결합
         if query_parts:
-            return " ".join(query_parts) + " " + request.chat.user
+            result = " ".join(query_parts) + " " + request.chat.user
+            # 캐시에 저장
+            self.cache.set(cache_key, result)
+            return result
 
         return request.chat.user

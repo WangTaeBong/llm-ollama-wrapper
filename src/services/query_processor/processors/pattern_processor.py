@@ -6,11 +6,10 @@
 
 import logging
 import random
-import re
-from typing import Optional, Set, Dict, Any
+from typing import Optional, Dict, Set
 
 from src.services.query_processor.base import QueryProcessorBase
-from src.services.query_processor.cache_manager import QueryCacheManager
+from src.services.query_processor.cache_manager import QueryCache
 
 # 로거 설정
 logger = logging.getLogger(__name__)
@@ -33,44 +32,46 @@ class PatternQueryProcessor(QueryProcessorBase):
         """
         super().__init__(settings, query_check_json_dict)
 
-        # 캐시 관리자 초기화
-        self.cache_manager = QueryCacheManager()
+        # 캐시 인스턴스 가져오기
+        self.cache = QueryCache.get_instance()
 
-        # 표준 정제 패턴
-        self._clean_query_pattern = re.compile(r'[~!@#$%^&*()=+\[\]{}:?,<>/\-_.]')
+        # 패턴 캐시 초기화
+        self._pattern_cache: Dict[str, Set[str]] = {}
 
-        logger.debug("패턴 쿼리 프로세서가 초기화되었습니다")
+        # logger.debug("패턴 쿼리 프로세서가 초기화되었습니다")
 
-    def clean_query(self, query: str) -> str:
+    def get_pattern_set(self, lang: str, dict_key: str) -> Set[str]:
         """
-        사용자 입력 쿼리에서 불필요한 특수 문자와 기호를 제거합니다.
+        지정된 언어와 사전 키에 대한 패턴 집합을 반환합니다.
 
         Args:
-            query (str): 정제할 원본 쿼리
+            lang: 언어 코드
+            dict_key: 사전 키
 
         Returns:
-            str: 정제된 쿼리
+            Set[str]: 패턴 집합 또는 빈 집합
         """
-        if not query:
-            return ""
-        return self._clean_query_pattern.sub('', query.lower())
+        cache_key = f"{lang}:{dict_key}"
 
-    def filter_query(self, query: str) -> str:
-        """
-        패턴 매칭을 위한 최소한의 필터링만 적용합니다.
+        # 캐시에서 가져오기
+        if cache_key in self._pattern_cache:
+            return self._pattern_cache[cache_key]
 
-        Args:
-            query (str): 필터링할 원본 쿼리
+        # 패턴 목록 가져오기
+        patterns = self.query_check_json_dict.get_dict_data(lang, dict_key)
+        if not patterns:
+            self._pattern_cache[cache_key] = set()
+            return set()
 
-        Returns:
-            str: 필터링된 쿼리
-        """
-        return query.lower() if query else ""
+        # 패턴 집합 생성 및 캐시
+        pattern_set = set(patterns)
+        self._pattern_cache[cache_key] = pattern_set
+
+        return pattern_set
 
     def check_query_sentence(self, request) -> Optional[str]:
         """
         사용자 쿼리를 미리 정의된 응답 패턴과 비교하여 적절한 응답을 생성합니다.
-        인사말, 종료 등의 특정 패턴을 인식하여 적절한 응답을 반환합니다.
 
         Args:
             request: 채팅 요청 객체
@@ -79,23 +80,15 @@ class PatternQueryProcessor(QueryProcessorBase):
             Optional[str]: 응답 문자열(일치하는 패턴이 있는 경우), None(없는 경우)
         """
         # 캐시 키 생성
-        cache_key = f"pattern_check:{request.meta.session_id}:{request.chat.user}"
-        cached_response = self.cache_manager.get(cache_key)
+        cache_key = f"pattern:{request.meta.session_id}:{request.chat.user}"
+
+        # 캐시에서 결과 확인
+        cached_response = self.cache.get(cache_key)
         if cached_response is not None:
             logger.debug(f"[{request.meta.session_id}] 패턴 캐시 사용: {cache_key}")
             return cached_response
 
-        # 설정 가져오기
-        query_lang_key_list = self.settings.lm_check.query_lang_key.split(',')
-        query_dict_key_list = self.settings.lm_check.query_dict_key.split(',')
-
-        if not query_lang_key_list or not query_dict_key_list:
-            return None
-
-        # 사용자 언어 코드 (ko, en, jp, cn 등)
         user_lang = request.chat.lang
-
-        # 쿼리 정제
         raw_query = self.clean_query(request.chat.user)
 
         # 너무 짧거나 숫자로만 구성된 쿼리 처리
@@ -103,68 +96,61 @@ class PatternQueryProcessor(QueryProcessorBase):
             farewells_msgs = self.query_check_json_dict.get_dict_data(user_lang, "farewells_msg")
             if farewells_msgs:
                 response = random.choice(farewells_msgs)
-                self.cache_manager.set(cache_key, response)
+                self.cache.set(cache_key, response)
                 return response
             return None
 
         try:
-            # 캐시 초기화 - 각 언어 코드에 대한 패턴 사전
-            pattern_cache = {}
+            # 설정 가져오기
+            query_lang_key_list = self.settings.lm_check.query_lang_key.split(',')
+            query_dict_key_list = self.settings.lm_check.query_dict_key.split(',')
 
-            # 1. 먼저 사용자 언어 코드와 일치하는 패턴 확인 (최적화)
+            # 패턴 매칭 - 사용자 언어 먼저 확인
             if user_lang in query_lang_key_list:
-                for data_dict in query_dict_key_list:
-                    # 패턴 목록 가져오기 (인사말, 종료 등)
-                    patterns = self.query_check_json_dict.get_dict_data(user_lang, data_dict)
-                    if not patterns:
-                        continue
+                result = self._match_patterns_for_language(raw_query, user_lang, query_dict_key_list, user_lang)
+                if result:
+                    self.cache.set(cache_key, result)
+                    return result
 
-                    # 패턴을 집합으로 변환하고 캐싱 (성능 최적화)
-                    pattern_set = set(patterns)
-                    pattern_cache[(user_lang, data_dict)] = pattern_set
-
-                    # 현재 쿼리가 패턴 집합에 있는지 확인
-                    if raw_query in pattern_set:
-                        # 응답 키 구성 (예: greetings → greetings_msg)
-                        response_key = f"{data_dict}_msg"
-                        # 일치하는 언어에 대한 응답 메시지 가져오기
-                        response_messages = self.query_check_json_dict.get_dict_data(user_lang, response_key)
-                        if response_messages:
-                            response = random.choice(response_messages)
-                            self.cache_manager.set(cache_key, response)
-                            return response
-
-            # 2. 사용자 언어에서 찾지 못한 경우 다른 언어 코드 확인
-            for chat_lang in query_lang_key_list:
-                # 이미 확인한 사용자 언어 건너뛰기
-                if chat_lang == user_lang:
+            # 다른 언어 확인
+            for lang in query_lang_key_list:
+                if lang == user_lang:
                     continue
 
-                for data_dict in query_dict_key_list:
-                    # 캐시에서 가져오거나 없으면 가져와서 캐싱
-                    if (chat_lang, data_dict) in pattern_cache:
-                        pattern_set = pattern_cache[(chat_lang, data_dict)]
-                    else:
-                        patterns = self.query_check_json_dict.get_dict_data(chat_lang, data_dict)
-                        if not patterns:
-                            continue
-                        pattern_set = set(patterns)
-                        pattern_cache[(chat_lang, data_dict)] = pattern_set
+                result = self._match_patterns_for_language(raw_query, lang, query_dict_key_list, user_lang)
+                if result:
+                    self.cache.set(cache_key, result)
+                    return result
 
-                    # 패턴 매칭
-                    if raw_query in pattern_set:
-                        # 다른 언어에서 패턴을 찾았지만 사용자 언어로 응답
-                        response_key = f"{data_dict}_msg"
-                        response_messages = self.query_check_json_dict.get_dict_data(user_lang, response_key)
-                        if response_messages:
-                            response = random.choice(response_messages)
-                            self.cache_manager.set(cache_key, response)
-                            return response
-
-            # 패턴이 일치하지 않으면 None 반환
             return None
 
         except Exception as e:
             logger.warning(f"[{request.meta.session_id}] check_query_sentence 오류: {e}")
-            # 오류 시 None 반환
             return None
+
+    def _match_patterns_for_language(self, query: str, pattern_lang: str,
+                                     dict_keys: list, response_lang: str) -> Optional[str]:
+        """
+        특정 언어의 패턴과 쿼리를 매칭하고 응답을 생성합니다.
+
+        Args:
+            query: 확인할 쿼리
+            pattern_lang: 패턴 언어
+            dict_keys: 확인할 사전 키 목록
+            response_lang: 응답 생성을 위한 언어
+
+        Returns:
+            Optional[str]: 매칭된 응답 또는 None
+        """
+        for dict_key in dict_keys:
+            pattern_set = self.get_pattern_set(pattern_lang, dict_key)
+
+            if query in pattern_set:
+                # 응답 키 구성 (예: greetings → greetings_msg)
+                response_key = f"{dict_key}_msg"
+                response_messages = self.query_check_json_dict.get_dict_data(response_lang, response_key)
+
+                if response_messages:
+                    return random.choice(response_messages)
+
+        return None

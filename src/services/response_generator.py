@@ -84,7 +84,7 @@ class ResponseGenerator:
             self._cached_settings['none_source_rag_target'] = self.settings.prompt.none_source_type.split(',')
             self._cached_settings['faq_category_rag_target_list'] = self.settings.prompt.faq_type.split(',')
 
-            logger.debug("Successfully loaded cached settings.")
+            # logger.debug("Successfully loaded cached settings.")
         except AttributeError as e:
             logger.warning(f"Attribute error while loading settings: {e}")
         except Exception as e:

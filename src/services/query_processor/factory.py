@@ -17,7 +17,7 @@ from src.services.query_processor.exceptions import ProcessorNotFoundError
 logger = logging.getLogger(__name__)
 
 
-class QueryProcessorFactory:
+class ProcessorFactory:
     """
     쿼리 프로세서 팩토리 클래스
 
@@ -30,8 +30,10 @@ class QueryProcessorFactory:
         "pattern": PatternQueryProcessor,
     }
 
+    _instances: Dict[str, QueryProcessorBase] = {}
+
     @classmethod
-    def register_processor(cls, name: str, processor_class: Type[QueryProcessorBase]) -> None:
+    def register(cls, name: str, processor_class: Type[QueryProcessorBase]) -> None:
         """
         새로운 쿼리 프로세서를 등록합니다.
 
@@ -42,42 +44,49 @@ class QueryProcessorFactory:
         cls._registry[name.lower()] = processor_class
         logger.info(f"쿼리 프로세서 '{name}'을(를) 등록했습니다")
 
-    def create_processor(self, processor_type: str, settings: Any,
-                         query_check_json_dict=None) -> QueryProcessorBase:
+    @classmethod
+    def create(cls, processor_type: str = "standard", settings: Any = None,
+               query_check_json_dict=None) -> QueryProcessorBase:
         """
         지정된 유형의 쿼리 프로세서를 생성합니다.
 
         Args:
             processor_type: 프로세서 유형
             settings: 설정 객체
-            query_check_json_dict: 쿼리 패턴 사전 (선택 사항)
+            query_check_json_dict: 쿼리 패턴 사전
 
         Returns:
             QueryProcessorBase: 생성된 쿼리 프로세서 인스턴스
-
-        Raises:
-            ProcessorNotFoundError: 지정된 유형의 프로세서를 찾을 수 없는 경우
         """
         processor_type = processor_type.lower()
 
-        if processor_type not in self._registry:
+        # 인스턴스 캐싱을 위한 키 생성
+        instance_key = f"{processor_type}_{id(settings)}"
+
+        # 이미 생성된 인스턴스가 있는지 확인
+        if instance_key in cls._instances:
+            return cls._instances[instance_key]
+
+        # 등록된 프로세서 클래스 확인
+        if processor_type not in cls._registry:
             logger.error(f"알 수 없는 쿼리 프로세서 유형: {processor_type}")
-            raise ProcessorNotFoundError(f"알 수 없는 쿼리 프로세서 유형: {processor_type}")
+            processor_type = "standard"  # 기본값으로 대체
 
-        processor_class = self._registry[processor_type]
-        logger.debug(f"'{processor_type}' 쿼리 프로세서를 생성합니다")
-        return processor_class(settings, query_check_json_dict)
+        # 프로세서 인스턴스 생성
+        processor_class = cls._registry[processor_type]
+        instance = processor_class(settings, query_check_json_dict)
 
-    def create_default_processor(self, settings: Any,
-                                 query_check_json_dict=None) -> QueryProcessorBase:
+        # 인스턴스 캐싱
+        cls._instances[instance_key] = instance
+
+        logger.debug(f"'{processor_type}' 쿼리 프로세서를 생성했습니다")
+        return instance
+
+    @classmethod
+    def clear_instances(cls) -> None:
         """
-        기본 쿼리 프로세서를 생성합니다.
-
-        Args:
-            settings: 설정 객체
-            query_check_json_dict: 쿼리 패턴 사전 (선택 사항)
-
-        Returns:
-            QueryProcessorBase: 생성된 쿼리 프로세서 인스턴스
+        캐시된 모든 인스턴스를 제거합니다.
+        설정이 변경되었을 때 호출하세요.
         """
-        return self.create_processor("standard", settings, query_check_json_dict)
+        cls._instances.clear()
+        logger.debug("모든 프로세서 인스턴스가 제거되었습니다")
