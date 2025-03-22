@@ -50,7 +50,7 @@ from src.common.restclient import rc
 from src.schema.chat_req import ChatRequest
 from src.schema.chat_res import ChatResponse, MetaRes, PayloadRes, ChatRes
 from src.schema.vllm_inquery import VllmInquery
-from src.services.chat_message_handler import create_chat_data, create_message
+from src.services.messaging.formatters import MessageFormatter
 from src.services.document_processor import DocumentProcessor
 from src.services.llm_history_handler import LlmHistoryHandler
 from src.services.query_processor import QueryProcessor
@@ -1167,6 +1167,9 @@ class ChatService:
         # 캐시 정리 확인
         self._check_cache_cleanup()
 
+        # 인스턴스 생성
+        self.formatter = MessageFormatter()
+
     async def _ensure_log_task_running(self):
         """
         Ensure the async logging task is running, start it if not.
@@ -1958,9 +1961,9 @@ class ChatService:
                 await self._log("debug", f"[{session_id}] Saving chat history to Redis (attempt {retry_count + 1})")
 
                 # 메시지 생성
-                chat_data = create_chat_data(session_id, [
-                    create_message("HumanMessage", self.request.chat.user),
-                    create_message("AIMessage", answer)
+                chat_data = self.formatter.create_chat_data(session_id, [
+                    self.formatter.create_message("HumanMessage", self.request.chat.user),
+                    self.formatter.create_message("AIMessage", answer)
                 ])
 
                 # Redis에 저장
