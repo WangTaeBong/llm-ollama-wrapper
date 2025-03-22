@@ -372,8 +372,9 @@ class ResponseGenerator:
                         if doc_name in existing_docs:
                             continue
 
-                        if data["is_web"]:
-                            url = data["page"]
+                        # 웹 검색 결과 처리 (URL이 있는 경우 하이퍼링크로 표시)
+                        if data["is_web"] or metadata.get('is_web_search', False):  # is_web_search 추가
+                            url = data["page"] or metadata.get('doc_page', '')
                             if url and (url.startswith("http://") or url.startswith("https://")):
                                 new_entries.append(f"- {doc_name} (<a href=\"{url}\" target=\"_blank\">Link</a>)")
                             else:
