@@ -1893,11 +1893,23 @@ class ChatService:
 
                 if settings.llm.llm_backend.lower() == "ollama":
                     # Process chat with history for Ollama
-                    await self._log("debug", f"[{session_id}] Processing chat with history for Ollama backend")
+                    await self._log("info", f"[{session_id}] Processing chat with history for Ollama backend")
+
                     rag_chat_chain = self.history_handler.init_chat_chain_with_history()
+
+                    # 개선된 히스토리 사용 여부 로깅
+                    use_improved_history = getattr(settings.llm, 'use_improved_history', False)
+                    await self._log("info", f"[{session_id}] 개선된 히스토리 기능 상태: {use_improved_history}")
+
                     chat_history_response = await self.history_handler.handle_chat_with_history(
                         self.request, trans_lang, rag_chat_chain
                     ) or {"context": [], "answer": ""}
+
+                    # 히스토리 처리 결과 로깅
+                    await self._log("debug",
+                                    f"[{session_id}] Ollama 히스토리 처리 결과: "
+                                    f"{len(chat_history_response.get('context', []))}개 문서, "
+                                    f"응답 길이: {len(chat_history_response.get('answer', ''))}")
 
                     # Update documents with history context if available
                     context = chat_history_response.get("context", [])
