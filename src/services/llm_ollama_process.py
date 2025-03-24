@@ -1395,6 +1395,11 @@ class ChatService:
                 session_id=session_id
             )
 
+            # 히스토리 설정 확인 로깅
+            await self._log("debug",
+                            f"[{session_id}] 히스토리 설정: chat_history.enabled={settings.chat_history.enabled}, "
+                            f"use_improved_history={getattr(settings.llm, 'use_improved_history', False)}")
+
             # Process LLM query with chat history or direct query
             start_llm_time = time.time()
             query_answer, vllm_retrival_document = await self._process_llm_query(documents, lang, trans_lang)
@@ -1893,9 +1898,16 @@ class ChatService:
 
                 if settings.llm.llm_backend.lower() == "ollama":
                     # Process chat with history for Ollama
-                    await self._log("info", f"[{session_id}] Processing chat with history for Ollama backend")
+                    await self._log("info",
+                                    f"[{session_id}] Ollama 히스토리 처리 시작. "
+                                    f"use_improved_history={getattr(settings.llm, 'use_improved_history', False)}")
 
                     rag_chat_chain = self.history_handler.init_chat_chain_with_history()
+
+                    # 더 명확한 진단 정보
+                    if rag_chat_chain is None:
+                        await self._log("error", f"[{session_id}] 채팅 체인 초기화 실패")
+                        return "채팅 체인 초기화에 실패했습니다. 다시 시도해 주세요.", None
 
                     # 개선된 히스토리 사용 여부 로깅
                     use_improved_history = getattr(settings.llm, 'use_improved_history', False)
@@ -1904,6 +1916,7 @@ class ChatService:
                     chat_history_response = await self.history_handler.handle_chat_with_history(
                         self.request, trans_lang, rag_chat_chain
                     ) or {"context": [], "answer": ""}
+                    await self._log("error", f"[{session_id}] chat_history_response: {chat_history_response}")
 
                     # 히스토리 처리 결과 로깅
                     await self._log("debug",

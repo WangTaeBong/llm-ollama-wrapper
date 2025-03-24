@@ -137,7 +137,6 @@ class OllamaHistoryHandler(BaseHistoryHandler):
     ) -> Optional[Dict[str, Any]]:
         """
         Ollama 모델로 히스토리를 활용한 채팅 요청을 처리합니다.
-        개선된 질문 재정의 기능을 추가하여 대화 맥락을 더 정확하게 유지합니다.
 
         Args:
             request: 채팅 요청
@@ -149,18 +148,6 @@ class OllamaHistoryHandler(BaseHistoryHandler):
         """
         session_id = self.current_session_id
 
-        # 개선된 질문 재정의 기능 사용 여부 확인
-        use_improved_history = getattr(settings.llm, 'use_improved_history', False)
-        logger.error('Useimproved_history')
-        # 개선된 질문 재정의 단계 추가
-        if use_improved_history:
-            logger.debug(f"[{session_id}] 개선된 질문 재정의 기능 사용")
-            rewritten_question = await self._rewrite_question(request.chat.user)
-        else:
-            rewritten_question = request.chat.user
-
-        logger.debug(f"[{session_id}] 최종 질문: '{rewritten_question}'")
-
         # 히스토리 관리를 포함한 체인 구성
         conversational_rag_chain = RunnableWithMessageHistory(
             runnable=rag_chat_chain,
@@ -170,10 +157,10 @@ class OllamaHistoryHandler(BaseHistoryHandler):
             output_message_key="answer",
         )
 
-        # 공통 입력 준비 - 재작성된 질문 사용
+        # 공통 입력 준비
         common_input = {
             "original_question": request.chat.user,
-            "input": rewritten_question,  # 재작성된 질문 사용
+            "input": request.chat.user,
             "history": "",  # Ollama 처리용 빈 문자열
             "language": language,
             "today": self._get_today(),
@@ -225,103 +212,6 @@ class OllamaHistoryHandler(BaseHistoryHandler):
             # 처리 완료된 입력 표시 해제
             if self.cache_manager.is_in_processed_set("inputs", input_id):
                 self.cache_manager.remove_from_processed_set("inputs", input_id)
-
-    async def _rewrite_question(self, original_question: str) -> str:
-        """
-        대화 이력을 기반으로 질문을 재정의합니다.
-
-        Args:
-            original_question: 원본 질문
-
-        Returns:
-            str: 재정의된 질문 또는 원본 질문
-        """
-        session_id = self.current_session_id
-        logger.error("_rewrite_question: ollama")
-
-        # 대화 이력 없는 경우 원본 질문 반환
-        session_history = self.get_session_history()
-        if len(session_history.messages) == 0:
-            logger.debug(f"[{session_id}] 대화 이력이 없어 원래 질문을 사용합니다.")
-            return original_question
-
-        try:
-            # 대화 이력 포맷팅
-            formatted_history = self.formatter.format_history_for_prompt(
-                session_history,
-                settings.llm.max_history_turns
-            )
-
-            # 정확한 경로에서 PromptManager 임포트
-            from src.utils.history_prompt_manager import PromptManager
-
-            logger.error("XXXXXXXXXXXXXXXX")
-            # 질문 재정의 프롬프트 템플릿 가져오기
-            rewrite_prompt_str = PromptManager.get_rewrite_prompt_template()
-            logger.error(rewrite_prompt_str)
-
-            # PromptTemplate 객체 생성
-            prompt_template = PromptTemplate(
-                template=rewrite_prompt_str,
-                input_variables=["history", "input"]
-            )
-
-            # 컨텍스트 준비
-            rewrite_context = {
-                "history": formatted_history,
-                "input": original_question,
-            }
-
-            # 질문 재정의 프롬프트 생성
-            rewrite_prompt = prompt_template.format(**rewrite_context)
-
-            # Ollama 모델을 사용하여 질문 재정의
-            from langchain_ollama.llms import OllamaLLM
-
-            # OllamaLLM 인스턴스 생성 (self.llm_model 재활용이 어려울 수 있어 새로 생성)
-            if hasattr(settings.ollama, 'access_type') and settings.ollama.access_type.lower() == 'url':
-                ollama_model = OllamaLLM(
-                    base_url=settings.ollama.ollama_url,
-                    model=settings.ollama.model_name,
-                    temperature=0.1  # 낮은 온도로 더 결정적인 결과 생성
-                )
-            else:
-                ollama_model = OllamaLLM(
-                    model=settings.ollama.model_name,
-                    temperature=0.1
-                )
-
-            # 시간 제한을 두고 질문 재정의 실행
-            start_time = time.time()
-            rewrite_timeout = getattr(settings.llm, 'rewrite_timeout', 3.0)
-
-            try:
-                # 비동기적으로 질문 재정의
-                rewritten_question = await asyncio.wait_for(
-                    asyncio.to_thread(ollama_model.invoke, rewrite_prompt, config={}),
-                    timeout=rewrite_timeout
-                )
-
-                rewrite_time = time.time() - start_time
-                logger.debug(f"[{session_id}] 질문 재정의 완료: {rewrite_time:.4f}초 소요")
-
-                # 재작성된 질문이 없거나 너무 짧으면 원래 질문 사용
-                if not rewritten_question or len(rewritten_question.strip()) < 5:
-                    logger.warning(f"[{session_id}] 질문 재정의 실패, 원래 질문 사용")
-                    return original_question
-
-                # 최종 재정의된 질문 반환
-                final_question = rewritten_question.strip()
-                logger.debug(f"[{session_id}] 최종 재정의 질문: '{final_question}'")
-                return final_question
-
-            except asyncio.TimeoutError:
-                logger.warning(f"[{session_id}] 질문 재정의 타임아웃, 원래 질문 사용")
-                return original_question
-
-        except Exception as e:
-            logger.error(f"[{session_id}] 질문 재정의 중 오류: {str(e)}")
-            return original_question
 
     async def handle_chat_with_history_vllm(
             self,

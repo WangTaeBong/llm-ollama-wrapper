@@ -88,17 +88,25 @@ class LlmHistoryHandler:
     def init_chat_chain_with_history(self):
         """
         히스토리가 포함된 채팅 체인을 초기화하거나 캐시에서 가져옵니다.
-        (OllamaHistoryHandler 호출)
+
+        이 메서드는 내부 핸들러의 init_chat_chain_with_history 메서드를 호출합니다.
+        내부 핸들러가 OllamaHistoryHandler인 경우에만 작동합니다.
 
         Returns:
-            Any: 초기화된 채팅 체인
+            Any: 초기화된 채팅 체인 또는 None (핸들러가 이 기능을 지원하지 않는 경우)
         """
-        # 호환성을 위해 캐스팅 시도
+        # 내부 핸들러 존재 확인
+        if not hasattr(self, '_handler'):
+            logger.error(f"[{self.current_session_id}] 내부 핸들러가 초기화되지 않았습니다")
+            return None
+
+        # 명시적으로 OllamaHistoryHandler 타입 확인
         from src.services.history.handlers.ollama_handler import OllamaHistoryHandler
         if isinstance(self._handler, OllamaHistoryHandler):
+            logger.debug(f"[{self.current_session_id}] OllamaHistoryHandler에서 체인 초기화 실행")
             return self._handler.init_chat_chain_with_history()
         else:
-            logger.warning(f"[{self.current_session_id}] 사용 중인 핸들러는 init_chat_chain_with_history를 지원하지 않습니다")
+            logger.warning(f"[{self.current_session_id}] 핸들러 타입 ({type(self._handler).__name__})은 초기화 기능을 지원하지 않습니다")
             return None
 
     def get_session_history(self) -> ChatMessageHistory:
@@ -125,6 +133,7 @@ class LlmHistoryHandler:
         Returns:
             Optional[Dict[str, Any]]: 채팅 응답 또는 None
         """
+        logger.error("handle_chat_with_history-llm_history_handler")
         return await self._handler.handle_chat_with_history(request, language, rag_chat_chain)
 
     async def handle_chat_with_history_vllm(self, request: ChatRequest, language: str) -> Tuple[str, List[Document]]:
