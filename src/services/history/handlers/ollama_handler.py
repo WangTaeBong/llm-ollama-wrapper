@@ -13,15 +13,14 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains.history_aware_retriever import create_history_aware_retriever
 from langchain.chains.retrieval import create_retrieval_chain
 from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableWithMessageHistory
 
 from src.schema.chat_req import ChatRequest
 from src.schema.vllm_inquery import VllmInquery
 from src.services.history.handlers.history_handler import BaseHistoryHandler
 from src.utils.prompt import PromptManager
-from src.utils.history_prompt_manager import PromptManager
+from src.utils.history_prompt_manager import PromptManager as HistoryPromptManager
 from src.services.history.utils.validators import validate_rewritten_question, extract_important_entities
 from src.common.config_loader import ConfigLoader
 
@@ -43,9 +42,6 @@ class OllamaHistoryHandler(BaseHistoryHandler):
     def init_chat_chain_with_history(self):
         """
         히스토리가 포함된 채팅 체인을 초기화하거나 캐시에서 가져옵니다.
-
-        Returns:
-            Any: 초기화된 채팅 체인
         """
         cache_key = f"{self.current_rag_sys_info}:{self.current_session_id}"
 
@@ -58,44 +54,43 @@ class OllamaHistoryHandler(BaseHistoryHandler):
         # 새 체인 생성
         logger.debug(f"[{self.current_session_id}] 새 Ollama 채팅 체인 생성")
 
-        # RAG 프롬프트 템플릿 가져오기
-        rag_prompt_template = self._get_rag_prompt_template()
+        try:
+            # RAG 프롬프트 템플릿 가져오기 (문자열)
+            rag_prompt_str = self._get_rag_prompt_template()
 
-        # 채팅 체인 프롬프트 구성
-        rag_chain_prompt = ChatPromptTemplate.from_messages([
-            ("system", rag_prompt_template),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}"),
-        ])
+            # 안전한 프롬프트 생성: 문자열 템플릿 대신 직접 채팅 프롬프트 구성
+            rag_chain_prompt = ChatPromptTemplate.from_messages([
+                ("system", rag_prompt_str),  # 문자열 직접 사용
+                MessagesPlaceholder(variable_name="chat_history"),
+                ("human", "{input}"),
+            ])
 
-        # 히스토리 인식 검색기 생성
-        history_aware_retriever = create_history_aware_retriever(
-            self.llm_model,
-            self.retriever,
-            PromptManager.get_contextualize_q_prompt()
-        )
+            # 히스토리 인식 검색기 생성
+            history_aware_retriever = create_history_aware_retriever(
+                self.llm_model,
+                self.retriever,
+                HistoryPromptManager.get_contextualize_q_prompt()
+            )
 
-        # 질문-응답 체인 생성
-        question_answer_chain = create_stuff_documents_chain(
-            self.llm_model,
-            rag_chain_prompt
-        )
+            # 질문-응답 체인 생성
+            question_answer_chain = create_stuff_documents_chain(
+                self.llm_model,
+                rag_chain_prompt
+            )
 
-        # 검색 체인 생성
-        chat_chain = create_retrieval_chain(
-            history_aware_retriever,
-            question_answer_chain
-        )
+            # 검색 체인 생성
+            chat_chain = create_retrieval_chain(
+                history_aware_retriever,
+                question_answer_chain
+            )
 
-        # 체인 유효성 검사
-        if not self._is_chain_valid(chat_chain):
-            logger.error(f"[{self.current_session_id}] 새로 생성된 체인이 유효하지 않습니다.")
-            raise ValueError("체인 생성 실패")
+            # 캐시에 체인 저장
+            self.cache_manager.set("chain", cache_key, chat_chain)
 
-        # 캐시에 체인 저장
-        self.cache_manager.set("chain", cache_key, chat_chain)
-
-        return chat_chain
+            return chat_chain
+        except Exception as e:
+            logger.error(f"[{self.current_session_id}] 채팅 체인 초기화 중 오류 발생: {str(e)}", exc_info=True)
+            return None
 
     def _get_rag_prompt_template(self) -> str:
         """
@@ -147,6 +142,12 @@ class OllamaHistoryHandler(BaseHistoryHandler):
             Optional[Dict[str, Any]]: 채팅 응답 또는 None
         """
         session_id = self.current_session_id
+        logger.debug(f"[{session_id}] Ollama 히스토리 처리 시작")
+
+        # rag_chat_chain이 None인 경우 처리
+        if rag_chat_chain is None:
+            logger.error(f"[{session_id}] rag_chat_chain이 None입니다. 체인 초기화 실패 가능성이 있습니다.")
+            return {"answer": "채팅 체인 초기화에 실패했습니다. 다시 시도해 주세요."}
 
         # 히스토리 관리를 포함한 체인 구성
         conversational_rag_chain = RunnableWithMessageHistory(
@@ -206,7 +207,7 @@ class OllamaHistoryHandler(BaseHistoryHandler):
             return response
 
         except Exception as e:
-            logger.error(f"[{session_id}] 체인 호출 중 오류 발생: {e}")
+            logger.error(f"[{session_id}] 체인 호출 중 오류 발생: {e}", exc_info=True)
             return None
         finally:
             # 처리 완료된 입력 표시 해제
