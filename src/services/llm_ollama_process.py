@@ -52,12 +52,16 @@ from src.schema.chat_res import ChatResponse, MetaRes, PayloadRes, ChatRes
 from src.schema.vllm_inquery import VllmInquery
 from src.services.messaging.formatters import MessageFormatter
 from src.services.document_processor import DocumentProcessor
-from src.services.llm_history_handler import LlmHistoryHandler
+from src.services.history.llm_history_handler import LlmHistoryHandler
 from src.services.query_processor import QueryProcessor
 from src.services.response_generator import ResponseGenerator
 from src.services.search_engine import SearchEngine
 from src.services.voc import VOCLinkProcessor
 from src.utils.redis_utils import RedisUtils
+
+# httpx 및 httpcore 로그 레벨 조정
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # Load application settings from configuration
 settings = ConfigLoader().get_settings()
@@ -1142,7 +1146,7 @@ class ChatService:
         self.retriever_service = RetrieverService(request)
         self.llm_service = LLMService(request)
 
-        # Initialize history handler if chat history is enabled in settings
+        # Initialize history handlers if chat history is enabled in settings
         self.history_handler = LlmHistoryHandler(
             mai_chat_llm,
             self.request,

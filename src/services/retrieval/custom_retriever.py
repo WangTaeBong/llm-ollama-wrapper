@@ -7,6 +7,7 @@
 import asyncio
 import logging
 import time
+from collections import defaultdict
 from typing import List, Dict, Any, Optional, Set
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
@@ -183,35 +184,46 @@ class CustomRetriever(BaseRetriever, BaseModel, RetrieverBase):
             return []
 
     async def ainvoke(
-            self, query: str, *, run_manager: Optional[CallbackManagerForRetrieverRun] = None, **kwargs
-    ) -> List[Document]:
+            self,
+            input_string: str,
+            config: Optional[Dict[str, Any]] = None,
+            **kwargs
+        ) -> List[Document]:
         """
         문서를 비동기적으로 검색합니다.
 
+        LangChain의 최신 Runnable 인터페이스와 호환되는 ainvoke 메서드입니다.
+
         Args:
-            query: 문서 검색을 위한 쿼리 문자열
-            run_manager: 선택적 콜백 관리자
+            input_string: 문서 검색을 위한 쿼리 문자열
+            config: 선택적 구성 매개변수
             **kwargs: 추가 매개변수
 
         Returns:
-            검색된 Document 객체 목록
+            List[Document]: 검색된 Document 객체 목록
         """
-        return await self._fetch_and_process_documents(query)
+        # 이전 버전 호환성을 위한 추가 인자 처리
+        run_manager = kwargs.pop('run_manager', None)
+
+        session_id = self.request_data.meta.session_id
+        logger.debug(f"[{session_id}] 비동기 쿼리 검색: {input_string}")
+
+        return await self._fetch_and_process_documents(input_string)
 
     async def _aget_relevant_documents(
             self, query: str, *, run_manager: Optional[CallbackManagerForRetrieverRun] = None
     ) -> List[Document]:
         """
-        문서를 비동기적으로 검색합니다 (지원 중단, _ainvoke 대신 사용).
+        문서를 비동기적으로 검색합니다 (LangChain 인터페이스 구현).
 
         Args:
             query: 문서 검색을 위한 쿼리 문자열
             run_manager: 선택적 콜백 관리자
 
         Returns:
-            검색된 Document 객체 목록
+            List[Document]: 검색된 Document 객체 목록
         """
-        return await self.ainvoke(query, run_manager=run_manager)
+        return await self.ainvoke(query, config=None, run_manager=run_manager)
 
     async def _fetch_and_process_documents(self, query: str) -> List[Document]:
         """
