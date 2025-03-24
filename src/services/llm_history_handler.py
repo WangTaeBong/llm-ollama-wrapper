@@ -22,7 +22,8 @@ from src.common.restclient import rc
 from src.schema.chat_req import ChatRequest
 from src.schema.retriever_req import RetrieverRequest, RetrieverMeta, RetrieverQuery
 from src.schema.vllm_inquery import VllmInquery
-from src.services.custom_retriever import CustomRetriever
+from src.services.retrieval import create_retriever
+from src.services.retrieval import CustomRetriever
 from src.services.response_generator import ResponseGenerator
 from src.utils.prompt import PromptManager
 from src.utils.redis_utils import RedisUtils
@@ -164,7 +165,7 @@ class LlmHistoryHandler:
             ),
         )
 
-        self.retriever = CustomRetriever(request_data=request_data)
+        self.retriever = create_retriever(request_data=request_data)
 
         if retrieval_documents:
             logger.debug(f"[{self.current_session_id}] Adding {len(retrieval_documents)} documents to the retriever.")
