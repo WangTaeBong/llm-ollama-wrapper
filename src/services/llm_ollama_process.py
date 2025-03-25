@@ -24,6 +24,7 @@ Dependencies:
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -34,7 +35,7 @@ from asyncio import Semaphore, create_task, wait_for, TimeoutError
 from contextlib import asynccontextmanager
 from functools import lru_cache, wraps
 from threading import Lock
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 from cachetools import TTLCache
 from fastapi import FastAPI, BackgroundTasks
@@ -83,31 +84,88 @@ _semaphore = Semaphore(settings.cache.max_concurrent_tasks)
 mai_chat_llm = None
 
 
-@lru_cache(maxsize=100)
-def get_or_create_chain(settings_key, model, prompt_template):
+def _create_model_key(model: Any) -> str:
     """
-    Retrieve a cached chain or create a new one based on a settings key.
-    Uses LRU cache for efficient caching.
+    모델 객체로부터 캐시 키로 사용할 수 있는 문자열을 생성합니다.
 
     Args:
-        settings_key (str): Unique key for the chain configuration.
-        model: LLM model instance.
-        prompt_template: Prompt template for the chain.
+        model: LLM 모델 객체(OllamaLLM 등)
 
     Returns:
-        chain: The chain instance (either cached or newly created).
+        str: 모델 식별 문자열
     """
-    with _chain_lock:
-        if settings_key in _chain_registry:
-            cached_chain = _chain_registry[settings_key]
-            # Ensure the cached chain has the required 'invoke' method
-            if not hasattr(cached_chain, 'invoke'):
-                _chain_registry[settings_key] = create_stuff_documents_chain(model, prompt_template)
-            return _chain_registry[settings_key]
+    # 모델 타입을 기준으로 키 생성
+    model_type = type(model).__name__
 
-        # Create and cache a new chain
-        _chain_registry[settings_key] = create_stuff_documents_chain(model, prompt_template)
-        return _chain_registry[settings_key]
+    # 만약 OllamaLLM이라면 모델 이름과 URL 추가
+    if model_type == "OllamaLLM":
+        model_name = getattr(model, "model", "unknown")
+        base_url = getattr(model, "base_url", "local")
+        temperature = getattr(model, "temperature", 0.7)
+        return f"{model_type}:{model_name}:{base_url}:{temperature}"
+
+    # 다른 모델 타입은 클래스 이름만 사용
+    return model_type
+
+
+def _create_prompt_key(prompt_template: Any) -> str:
+    """
+    프롬프트 템플릿으로부터 캐시 키로 사용할 수 있는 문자열을 생성합니다.
+
+    Args:
+        prompt_template: 프롬프트 템플릿 객체
+
+    Returns:
+        str: 프롬프트 식별 문자열
+    """
+    # 템플릿 문자열을 해시하여 키 생성
+    if hasattr(prompt_template, "template"):
+        template_str = str(prompt_template.template)
+    elif hasattr(prompt_template, "messages"):
+        template_str = str(prompt_template.messages)
+    else:
+        template_str = str(prompt_template)
+
+    # 해시 생성
+    return hashlib.md5(template_str.encode('utf-8')).hexdigest()
+
+
+def get_or_create_chain(settings_key: str, model: Any, prompt_template: Any) -> Any:
+    """
+    주어진 설정, 모델, 프롬프트 템플릿에 대한 체인을 가져오거나 생성합니다.
+    OllamaLLM과 같은 해시 불가능한 객체를 안전하게 처리합니다.
+
+    Args:
+        settings_key: 설정 키
+        model: LLM 모델 객체
+        prompt_template: 프롬프트 템플릿
+
+    Returns:
+        Any: 체인 인스턴스(캐시된 것 또는 새로 생성된 것)
+    """
+    # 모델과 프롬프트에 대한 안정적인 키 생성
+    model_key = _create_model_key(model)
+    prompt_key = _create_prompt_key(prompt_template)
+
+    # 결합된 캐시 키 생성
+    combined_key = f"{settings_key}:{model_key}:{prompt_key}"
+
+    with _chain_lock:
+        if combined_key in _chain_registry:
+            cached_chain = _chain_registry[combined_key]
+            # 캐시된 체인이 필요한 'invoke' 메서드를 가지고 있는지 확인
+            if hasattr(cached_chain, 'invoke'):
+                return _chain_registry[combined_key]
+
+        # 새 체인 생성
+        try:
+            _chain_registry[combined_key] = create_stuff_documents_chain(model, prompt_template)
+            return _chain_registry[combined_key]
+        except Exception as e:
+            # 체인 생성 실패 시 기록하고 재시도하지 않도록 None 반환
+            logger.error(f"체인 생성 중 오류 발생: {str(e)}", exc_info=True)
+            # 기본 체인을 생성하여 반환할 수도 있음
+            return None
 
 
 async def limited_chain_invoke(chain, context, timeout=60):
@@ -129,22 +187,52 @@ async def limited_chain_invoke(chain, context, timeout=60):
         TimeoutError: If the operation exceeds the timeout period.
     """
     start_time = time.time()
+    session_id = context.get("input", "")[:20] if isinstance(context, dict) and "input" in context else "unknown"
 
     async with _semaphore:
         try:
-            if inspect.iscoroutinefunction(chain.invoke):
+            # 비동기 호출 시도
+            if hasattr(chain, "ainvoke") and callable(getattr(chain, "ainvoke")):
+                logger.debug(f"[{session_id}] 체인 비동기 호출 (ainvoke)")
                 # Apply timeout to async call
-                return await wait_for(chain.invoke(context), timeout=timeout)
+                result = await wait_for(chain.ainvoke(context), timeout=timeout)
+
+                # 결과가 코루틴인지 추가 확인
+                if asyncio.iscoroutine(result):
+                    logger.debug(f"[{session_id}] 코루틴 응답 감지, 추가 await 처리")
+                    result = await wait_for(result, timeout=timeout)
+
+                return result
+
+            # 동기 함수를 별도 스레드에서 실행
+            elif hasattr(chain, "invoke") and callable(getattr(chain, "invoke")):
+                logger.debug(f"[{session_id}] 체인 동기 호출 (invoke via thread)")
+                # For sync calls, use to_thread
+                return await wait_for(asyncio.to_thread(chain.invoke, context), timeout=timeout)
+
+            # 호출 가능한 객체인 경우
+            elif callable(chain):
+                logger.debug(f"[{session_id}] 호출 가능한 체인 객체 호출")
+                # Try direct call if chain is callable
+                result = chain(context)
+
+                # 결과가 코루틴인지 확인
+                if asyncio.iscoroutine(result):
+                    logger.debug(f"[{session_id}] 코루틴 결과 감지, await 처리")
+                    return await wait_for(result, timeout=timeout)
+                return result
+
             else:
-                # For sync calls, use wait_for with a task wrapper
-                return await wait_for(create_task(chain.invoke(context)), timeout=timeout)
+                # 적절한 호출 메서드를 찾을 수 없음
+                raise ValueError(f"[{session_id}] 체인 호출 메서드를 찾을 수 없습니다")
+
         except TimeoutError:
             elapsed = time.time() - start_time
-            logger.error(f"Chain invocation timed out: {elapsed:.2f}s (limit: {timeout}s)")
+            logger.error(f"[{session_id}] Chain invocation timed out: {elapsed:.2f}s (limit: {timeout}s)")
             raise
         except Exception as e:
             elapsed = time.time() - start_time
-            logger.error(f"Chain invocation failed: {elapsed:.2f}s after: {type(e).__name__}: {str(e)}")
+            logger.error(f"[{session_id}] Chain invocation failed: {elapsed:.2f}s after: {type(e).__name__}: {str(e)}")
             raise
 
 
@@ -553,8 +641,12 @@ class LLMService:
         start_time = time.time()
         session_id = self.request.meta.session_id
         try:
+            if mai_chat_llm is None:
+                raise ValueError("LLM 모델이 초기화되지 않았습니다. 설정을 확인하세요.")
+
             prompt_template = self.response_generator.get_rag_qa_prompt(self.request.meta.rag_sys_info)
             chat_prompt = ChatPromptTemplate.from_template(prompt_template)
+
             chain = get_or_create_chain(self.settings_key, mai_chat_llm, chat_prompt)
 
             logger.debug(
@@ -1002,6 +1094,7 @@ class LLMService:
         context = {
             "input": self.request.chat.user,
             "context": documents,
+            "history": "",  # ollama 에서는 빈 값으로 전달
             "language": language,
             "today": self.response_generator.get_today(),
         }
@@ -1020,8 +1113,30 @@ class LLMService:
         try:
             if settings.llm.llm_backend.lower() == "ollama":
                 logger.debug(f"[{session_id}] Starting Ollama chain invocation")
-                result = await limited_chain_invoke(self.chain, context, timeout=self.timeout)
-                if inspect.iscoroutine(result):
+
+                # 체인 호출 방식 결정 (동기/비동기)
+                if hasattr(self.chain, "ainvoke") and callable(getattr(self.chain, "ainvoke")):
+                    # 코루틴에 대한 직접 await
+                    logger.debug(f"[{session_id}] Ollama 체인 비동기 호출")
+                    try:
+                        result = await self.chain.ainvoke(context)
+                    except Exception as e:
+                        logger.error(f"[{session_id}] 비동기 체인 호출 오류: {str(e)}")
+                        raise
+                elif hasattr(self.chain, "invoke") and callable(getattr(self.chain, "invoke")):
+                    # 동기 함수를 별도 스레드에서 실행
+                    logger.debug(f"[{session_id}] Ollama 체인 동기 호출 (스레드 풀 사용)")
+                    try:
+                        result = await asyncio.to_thread(self.chain.invoke, context)
+                    except Exception as e:
+                        logger.error(f"[{session_id}] 동기 체인 호출 오류: {str(e)}")
+                        raise
+                else:
+                    raise ValueError(f"[{session_id}] 올바른 체인 호출 메서드를 찾을 수 없습니다")
+
+                # 결과가 코루틴인지 확인하고 추가 await 처리
+                if asyncio.iscoroutine(result):
+                    logger.debug(f"[{session_id}] 코루틴 응답 감지, 추가 await 처리")
                     result = await result
             elif settings.llm.llm_backend.lower() == "vllm":
                 logger.debug(f"[{session_id}] Starting vLLM invocation")
@@ -1042,8 +1157,12 @@ class LLMService:
                 )
 
                 response = await self.call_vllm_endpoint(vllm_request)
-                logger.debug(response)
                 result = response.get("generated_text", "")
+
+            # 결과가 없거나 빈 문자열인 경우 처리
+            if result is None or (isinstance(result, str) and result.strip() == ""):
+                logger.warning(f"[{session_id}] 빈 응답 결과, 기본 메시지 반환")
+                result = "죄송합니다. 응답을 생성할 수 없습니다. 다시 시도해 주세요."
 
             elapsed = time.time() - start_time
             logger.info(
@@ -1595,12 +1714,17 @@ class ChatService:
                 await retrieval_task
                 documents = retrieval_task.result()
 
+                elapsed = self._record_stage("document_retrieval")
+                await self._log("info", f"[{session_id}] 문서 검색 완료: {elapsed:.4f}초 소요, {len(documents)}개 문서 검색됨",
+                                session_id=session_id)
+
                 # 포스트 프로세서 업데이트
                 post_processor.documents = documents
 
                 context = {
                     "input": self.request.chat.user,
                     "context": documents,
+                    "history": "",  # 빈 값으로 전달
                     "language": lang,
                     "today": self.response_generator.get_today(),
                 }
@@ -1615,7 +1739,8 @@ class ChatService:
                     })
 
                 # 시스템 프롬프트 생성
-                vllm_inquery_context = self.llm_service.build_system_prompt(context)
+                # vllm_inquery_context = self.llm_service.build_system_prompt(context)
+                vllm_inquery_context = self.llm_service.build_system_prompt_gemma(context)
 
                 # 일반 vLLM 요청 준비
                 vllm_request = VllmInquery(
@@ -1916,7 +2041,6 @@ class ChatService:
                     chat_history_response = await self.history_handler.handle_chat_with_history(
                         self.request, trans_lang, rag_chat_chain
                     ) or {"context": [], "answer": ""}
-                    await self._log("error", f"[{session_id}] chat_history_response: {chat_history_response}")
 
                     # 히스토리 처리 결과 로깅
                     await self._log("debug",
