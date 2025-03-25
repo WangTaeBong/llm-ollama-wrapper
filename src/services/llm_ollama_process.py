@@ -48,6 +48,7 @@ from src.common.config_loader import ConfigLoader
 from src.common.error_cd import ErrorCd
 from src.common.query_check_dict import QueryCheckDict
 from src.common.restclient import rc
+from src.chat.circuit import CircuitBreaker
 from src.schema.chat_req import ChatRequest
 from src.schema.chat_res import ChatResponse, MetaRes, PayloadRes, ChatRes
 from src.schema.vllm_inquery import VllmInquery
@@ -322,107 +323,8 @@ def validate_settings():
         raise ValueError("LLM backend must be either 'ollama' or 'vllm'")
 
 
-class CircuitBreaker:
-    """
-    Circuit breaker pattern implementation for external service calls.
-
-    Protects system stability by opening the circuit after consecutive failures,
-    preventing additional requests, and automatically attempting recovery.
-
-    The circuit has three states:
-    - CLOSED: Normal operation, requests are passed through
-    - OPEN: Circuit is open, all requests are rejected
-    - HALF-OPEN: Test state, limited requests are allowed to check if service is recovered
-    """
-
-    def __init__(self, failure_threshold=3, recovery_timeout=60, reset_timeout=300):
-        """
-        Initialize the circuit breaker.
-
-        Args:
-            failure_threshold (int): Number of consecutive failures before opening the circuit.
-            recovery_timeout (int): Seconds to wait before attempting recovery.
-            reset_timeout (int): Seconds to wait before fully resetting the circuit.
-        """
-        self.failure_count = 0
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.reset_timeout = reset_timeout
-        self.open_time = None
-        self.state = "CLOSED"
-        self.half_open_calls = 0
-        self.lock = Lock()
-
-    def is_open(self):
-        """
-        Check if the circuit is open and handle auto-recovery.
-
-        Returns:
-            bool: True if requests should be blocked, False if allowed.
-        """
-        with self.lock:
-            if self.state == "CLOSED":
-                return False
-
-            if self.state == "OPEN":
-                # Check if recovery timeout has elapsed
-                if time.time() - self.open_time > self.recovery_timeout:
-                    logger.info("Circuit breaker transitioning to half-open state")
-                    self.state = "HALF-OPEN"
-                    self.half_open_calls = 0
-                    return False
-                return True
-
-            # In HALF-OPEN state, allow limited calls
-            if self.half_open_calls < 1:
-                self.half_open_calls += 1
-                return False
-            return True
-
-    def record_success(self):
-        """
-        Record a successful call to the service.
-
-        In HALF-OPEN state, this will close the circuit.
-        In CLOSED state, this resets the failure counter.
-        """
-        with self.lock:
-            if self.state == "HALF-OPEN":
-                logger.info("Circuit breaker closed - service has recovered")
-                self.state = "CLOSED"
-                self.failure_count = 0
-                self.open_time = None
-                self.half_open_calls = 0
-            elif self.state == "CLOSED":
-                self.failure_count = 0
-
-    def record_failure(self):
-        """
-        Record a failed call to the service.
-
-        In HALF-OPEN state, this will re-open the circuit.
-        In CLOSED state, this increases the failure counter and may open the circuit.
-        """
-        with self.lock:
-            if self.state == "HALF-OPEN":
-                logger.warning("Circuit breaker keeping open state - service still failing")
-                self.state = "OPEN"
-                self.open_time = time.time()
-            elif self.state == "CLOSED":
-                self.failure_count += 1
-                if self.failure_count >= self.failure_threshold:
-                    logger.warning("Circuit breaker opening - failure threshold reached")
-                    self.state = "OPEN"
-                    self.open_time = time.time()
-
-
-# Create circuit breaker for external services with configuration from settings
-_vllm_circuit_breaker = CircuitBreaker(
-    failure_threshold=settings.circuit_breaker.failure_threshold if hasattr(settings.circuit_breaker,
-                                                                            'failure_threshold') else 3,
-    recovery_timeout=settings.circuit_breaker.recovery_timeout if hasattr(settings.circuit_breaker,
-                                                                          'recovery_timeout') else 60,
-    reset_timeout=settings.circuit_breaker.reset_timeout if hasattr(settings.circuit_breaker, 'reset_timeout') else 300
+_llm_circuit_breaker = CircuitBreaker.create_from_config(
+    name="llm_service"  # 서비스 식별을 위한 이름 추가
 )
 
 
@@ -447,50 +349,50 @@ def async_retry(max_retries=3, backoff_factor=1.5, circuit_breaker=None):
             last_exception = None
 
             while retry_count < max_retries:
-                # Check circuit breaker
+                # 회로 차단기 확인 - 여기서 참조 메서드가 동일해야 함
                 if circuit_breaker and circuit_breaker.is_open():
-                    logger.warning(f"Circuit open, skipping call to {func.__name__}")
-                    raise RuntimeError(f"Service unavailable: circuit is open for {func.__name__}")
+                    logger.warning(f"회로 열림, {func.__name__} 호출 건너뜀")
+                    raise RuntimeError(f"서비스 사용 불가: {func.__name__}에 대한 회로가 열려 있음")
 
                 try:
                     start_time = time.time()
                     result = await func(*args, **kwargs)
                     execution_time = time.time() - start_time
 
-                    # Log execution time for monitoring
-                    logger.debug(f"Function {func.__name__} completed: {execution_time:.4f}s")
+                    # 로그 실행 시간 모니터링
+                    logger.debug(f"함수 {func.__name__} 완료: {execution_time:.4f}초")
 
-                    # Record success to circuit breaker
+                    # 회로 차단기에 성공 기록
                     if circuit_breaker:
                         circuit_breaker.record_success()
 
                     return result
                 except (TimeoutError, ConnectionError) as e:
-                    # Record failure to circuit breaker for specific errors
+                    # 특정 오류에 대해 회로 차단기에 실패 기록
                     if circuit_breaker:
-                        circuit_breaker.record_failure()
+                        circuit_breaker.record_failure(e)  # 예외 객체 전달
 
                     retry_count += 1
                     wait_time = backoff_factor ** retry_count
                     last_exception = e
 
                     logger.warning(
-                        f"Retry {retry_count}/{max_retries} for {func.__name__} "
-                        f"after {wait_time:.2f}s - Cause: {type(e).__name__}: {str(e)}"
+                        f"{func.__name__}에 대한 재시도 {retry_count}/{max_retries} "
+                        f"{wait_time:.2f}초 후 - 원인: {type(e).__name__}: {str(e)}"
                     )
 
-                    # Wait before retrying
+                    # 재시도 전 대기
                     await asyncio.sleep(wait_time)
                 except Exception as e:
-                    logger.warning(f"async_retry exception: {e}")
-                    # For other exceptions, record failure but don't retry
+                    logger.warning(f"async_retry 예외: {e}")
+                    # 다른 예외에 대해서는 실패 기록하되 재시도 안 함
                     if circuit_breaker:
-                        circuit_breaker.record_failure()
+                        circuit_breaker.record_failure(e)  # 예외 객체 전달
                     raise
 
-            # If we get here, all retries failed
-            logger.error(f"All {max_retries} retries failed for {func.__name__}")
-            raise last_exception or RuntimeError(f"All retries failed for {func.__name__}")
+            # 모든 재시도 실패
+            logger.error(f"{func.__name__}에 대한 모든 {max_retries}회 재시도 실패")
+            raise last_exception or RuntimeError(f"{func.__name__}에 대한 모든 재시도 실패")
 
         return wrapper
 
@@ -774,8 +676,7 @@ class LLMService:
             basic_prompt = f"<start_of_turn>user\n다음 질문에 답해주세요: {context.get('input', '질문 없음')}\n<end_of_turn>\n<start_of_turn>model\n"
             return basic_prompt
 
-
-    @async_retry(max_retries=2, backoff_factor=2, circuit_breaker=_vllm_circuit_breaker)
+    @async_retry(max_retries=2, backoff_factor=2, circuit_breaker=_llm_circuit_breaker)
     async def call_vllm_endpoint(self, data: VllmInquery):
         """
         Call vLLM endpoint with retry and circuit breaker.
@@ -794,7 +695,7 @@ class LLMService:
         logger.debug(f"[{session_id}] Calling vLLM endpoint (stream={data.stream})")
 
         # circuit_breaker 확인
-        if _vllm_circuit_breaker.is_open():
+        if _llm_circuit_breaker.is_open():
             logger.warning(f"[{session_id}] circuit_breaker 열려 있어 요청을 건너뜁니다.")
             raise RuntimeError("vLLM 서비스 사용할 수 없음: circuit_breaker가 열려 있습니다")
 
@@ -810,7 +711,7 @@ class LLMService:
             self.metrics["total_time"] += elapsed
 
             # circuit_breaker 업데이트
-            _vllm_circuit_breaker.record_success()
+            _llm_circuit_breaker.record_success()
 
             return response
         except Exception as e:
@@ -820,7 +721,7 @@ class LLMService:
             self.metrics["error_count"] += 1
 
             # circuit_breaker 업데이트
-            _vllm_circuit_breaker.record_failure()
+            _llm_circuit_breaker.record_failure()
 
             raise
 
@@ -861,7 +762,7 @@ class LLMService:
                 # 마지막 청크 처리
                 if processed_chunk.get('finished', False) or processed_chunk.get('error', False):
                     # 회로 차단기 성공 기록
-                    _vllm_circuit_breaker.record_success()
+                    _llm_circuit_breaker.record_success()
 
                     # 메트릭 업데이트
                     elapsed = time.time() - start_time
@@ -879,7 +780,7 @@ class LLMService:
             self.metrics["error_count"] += 1
 
             # 회로 차단기 실패 기록
-            _vllm_circuit_breaker.record_failure()
+            _llm_circuit_breaker.record_failure()
 
             # 오류 청크 반환
             yield {
