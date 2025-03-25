@@ -133,7 +133,6 @@ class LlmHistoryHandler:
         Returns:
             Optional[Dict[str, Any]]: 채팅 응답 또는 None
         """
-        logger.error("handle_chat_with_history-llm_history_handler")
         return await self._handler.handle_chat_with_history(request, language, rag_chat_chain)
 
     async def handle_chat_with_history_vllm(self, request: ChatRequest, language: str) -> Tuple[str, List[Document]]:

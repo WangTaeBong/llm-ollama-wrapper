@@ -3,7 +3,7 @@ import logging
 from typing import List, Dict, Any, Tuple
 
 from src.common.config_loader import ConfigLoader
-from src.services.chat_message_handler import generate_redis_key
+from src.services.messaging.storage import RedisKeyGenerator
 from src.utils.redis_manager import RedisManager
 
 # 설정 로드
@@ -28,6 +28,8 @@ class RedisUtils:
 
     # 디버그 모드 설정 (로깅 수준 제어용)
     _debug_mode = False
+
+    key_generator = RedisKeyGenerator()
 
     @classmethod
     def set_debug_mode(cls, enabled: bool = False) -> None:
@@ -67,7 +69,7 @@ class RedisUtils:
             return False
 
         try:
-            key = generate_redis_key(system_info, session_id)
+            key = cls.key_generator.generate_key(system_info, session_id)
 
             # 파이프라인 사용하여 명령 일괄 처리
             with sync_redis.pipeline(transaction=False) as pipe:
@@ -109,7 +111,7 @@ class RedisUtils:
                     logger.debug("Redis connection not available for saving message (async)")
                 return False
 
-            key = generate_redis_key(system_info, session_id)
+            key = cls.key_generator.generate_key(system_info, session_id)
 
             # 비동기 파이프라인 사용하여 명령 일괄 처리
             async with async_redis.pipeline(transaction=False) as pipe:
@@ -149,7 +151,7 @@ class RedisUtils:
             return []
 
         try:
-            key = generate_redis_key(system_info, session_id)
+            key = cls.key_generator.generate_key(system_info, session_id)
             count = int(settings.redis.get_message_count)
 
             # 메시지 목록 조회 및 JSON 디코딩
@@ -188,7 +190,7 @@ class RedisUtils:
                     logger.debug("Redis connection not available for retrieving messages (async)")
                 return []
 
-            key = generate_redis_key(system_info, session_id)
+            key = cls.key_generator.generate_key(system_info, session_id)
             count = int(settings.redis.get_message_count)
 
             # 메시지 목록 비동기 조회 및 JSON 디코딩
@@ -222,7 +224,7 @@ class RedisUtils:
             return False
 
         try:
-            key = generate_redis_key(system_info, session_id)
+            key = cls.key_generator.generate_key(system_info, session_id)
             result = sync_redis.delete(key)
             return result > 0  # 삭제된 키의 수가 0보다 크면 성공
         except Exception as e:
@@ -250,7 +252,7 @@ class RedisUtils:
                     logger.debug("Redis connection not available for deleting key (async)")
                 return False
 
-            key = generate_redis_key(system_info, session_id)
+            key = cls.key_generator.generate_key(system_info, session_id)
             result = await async_redis.delete(key)
             return result > 0  # 삭제된 키의 수가 0보다 크면 성공
         except Exception as e:
@@ -359,7 +361,7 @@ class RedisUtils:
             return -2  # -2는 키가 존재하지 않음을 의미
 
         try:
-            key = generate_redis_key(system_info, session_id)
+            key = cls.key_generator.generate_key(system_info, session_id)
             return sync_redis.ttl(key)
         except Exception as e:
             logger.error(f"Failed to get TTL for Redis key (sync): {e}")
@@ -384,7 +386,7 @@ class RedisUtils:
             if not async_redis:
                 return -2  # -2는 키가 존재하지 않음을 의미
 
-            key = generate_redis_key(system_info, session_id)
+            key = cls.key_generator.generate_key(system_info, session_id)
             return await async_redis.ttl(key)
         except Exception as e:
             logger.error(f"Failed to get TTL for Redis key (async): {e}")

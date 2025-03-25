@@ -59,7 +59,7 @@ os.makedirs(settings.log.log_path, exist_ok=True)
 
 class InterceptHandler(logging.Handler):
     """
-    Custom logging handler that intercepts logs from the standard logging module
+    Custom logging handlers that intercepts logs from the standard logging module
     and forwards them to Loguru.
     """
 
@@ -112,11 +112,11 @@ def configure_uvicorn_access_log():
     uvicorn_access_logger.setLevel(settings.log.uvicorn_log_level)
     uvicorn_access_logger.handlers = []  # Remove existing handlers
 
-    # Create file handler for Uvicorn access logs
+    # Create file handlers for Uvicorn access logs
     access_log_file = os.path.join(settings.log.log_path, settings.log.uvicorn_access_filename)
     file_handler = logging.FileHandler(str(access_log_file))
 
-    # Create console handler for Uvicorn access logs
+    # Create console handlers for Uvicorn access logs
     console_handler = logging.StreamHandler(sys.stdout)
 
     # Define formatter for file logs
@@ -130,7 +130,7 @@ def configure_uvicorn_access_log():
     )
     colorized_formatter = logging.Formatter(colorized_format, datefmt="%Y-%m-%d %H:%M:%S")
 
-    # Set the formatters for each handler
+    # Set the formatters for each handlers
     file_handler.setFormatter(file_formatter)
     console_handler.setFormatter(colorized_formatter)
 
@@ -148,11 +148,11 @@ def configure_uvicorn_error_log():
     uvicorn_error_logger.setLevel(logging.WARNING)
     uvicorn_error_logger.handlers = []  # Remove existing handlers
 
-    # Create file handler for Uvicorn error logs
+    # Create file handlers for Uvicorn error logs
     error_log_file = os.path.join(settings.log.log_path, settings.log.uvicorn_error_filename)
     file_handler = logging.FileHandler(str(error_log_file))
 
-    # Create console handler for Uvicorn error logs
+    # Create console handlers for Uvicorn error logs
     console_handler = logging.StreamHandler(sys.stdout)
 
     # Define formatter for file logs
@@ -166,7 +166,7 @@ def configure_uvicorn_error_log():
     )
     colorized_formatter = logging.Formatter(colorized_format, datefmt="%Y-%m-%d %H:%M:%S")
 
-    # Set the formatters for each handler
+    # Set the formatters for each handlers
     file_handler.setFormatter(file_formatter)
     console_handler.setFormatter(colorized_formatter)
 
@@ -221,7 +221,7 @@ def schedule_midnight_rotation():
         try:
             # Rotate main controller log file
             controller_log_path = os.path.join(settings.log.log_path, settings.log.log_filename)
-            copy_and_truncate(str(controller_log_path), "MAI_Controller")
+            copy_and_truncate(str(controller_log_path), "MAI_LLM_Wrapper")
 
             # Rotate Uvicorn log file
             uvicorn_log_path = os.path.join(settings.log.log_path, settings.log.uvicorn_log_filename)

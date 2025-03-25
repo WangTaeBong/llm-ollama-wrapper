@@ -522,7 +522,7 @@ class RestClient:
         Set the shared aiohttp.ClientSession for all asynchronous requests.
 
         This method should be called during application startup (e.g., in FastAPI's
-        startup event handler) to initialize the global session used by all async
+        startup event handlers) to initialize the global session used by all async
         request methods.
 
         Args:

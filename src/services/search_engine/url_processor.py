@@ -26,7 +26,7 @@ class URLProcessor:
         # URL 패턴 컴파일
         self._url_pattern = re.compile(
             r"https?://(?:www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-ㄱ-ㅎ가-힣a-zA-Z0-9@:%_+.~#?&/=]*")
-        logger.debug("URL 처리기가 초기화되었습니다")
+        # logger.debug("URL 처리기가 초기화되었습니다")
 
     def extract_urls(self, text: str) -> List[str]:
         """

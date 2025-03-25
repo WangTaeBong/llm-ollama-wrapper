@@ -44,7 +44,7 @@ async def log_request(request: ChatRequest) -> ChatRequest:
     logger.info(f"Request[{safe_request.meta.rag_sys_info}/{safe_request.meta.session_id}] {safe_request.chat.user}")
 
     # Log detailed request data at DEBUG level
-    logger.debug(f"Received chat request: {safe_request}")
+    # logger.debug(f"Received chat request: {safe_request}")
 
     return request
 

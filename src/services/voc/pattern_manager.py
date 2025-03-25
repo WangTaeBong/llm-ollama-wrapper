@@ -39,7 +39,7 @@ class PatternManager:
         self._compiled_patterns: Dict[str, Pattern] = {}
         self._init_patterns()
 
-        logger.debug("PatternManager 인스턴스가 초기화되었습니다")
+        # logger.debug("PatternManager 인스턴스가 초기화되었습니다")
 
     def _init_patterns(self) -> None:
         """
@@ -51,8 +51,6 @@ class PatternManager:
         try:
             # URL 패턴 컴파일
             self._compiled_patterns['url'] = re.compile(self.url_pattern)
-
-            logger.debug("패턴이 성공적으로 컴파일되었습니다")
         except re.error as e:
             logger.error(f"정규식 컴파일 오류: {e}")
         except Exception as e:

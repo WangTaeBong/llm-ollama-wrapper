@@ -102,6 +102,10 @@ class HistoryHandlerFactory:
 
         # Ollama 백엔드 확인
         if backend == 'ollama':
+            # Ollama에서도 모델 이름 기반으로 Gemma 확인
+            if cls._is_gemma_model():
+                logger.debug(f"[{request.meta.session_id}] Ollama에서 Gemma 모델 감지됨")
+                return "gemma"
             return "ollama"
 
         # vLLM 백엔드인 경우 Gemma 모델 확인

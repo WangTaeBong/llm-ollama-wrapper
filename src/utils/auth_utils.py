@@ -91,7 +91,7 @@ async def verify_authentication(request: Request):
     It calls 'is_authenticated' to determine whether the user has a valid session.
     If the user is not authenticated or the session has expired, it raises an HTTPException
     with a 303 status code and a 'Location' header pointing to the login page. A global
-    exception handler should catch this exception and perform the appropriate redirection.
+    exception handlers should catch this exception and perform the appropriate redirection.
 
     Args:
         request (Request): The incoming FastAPI request.

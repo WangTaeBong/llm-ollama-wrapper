@@ -2048,14 +2048,26 @@ class ChatService:
                                     f"{len(chat_history_response.get('context', []))}개 문서, "
                                     f"응답 길이: {len(chat_history_response.get('answer', ''))}")
 
+                    # 문서 컨텍스트 업데이트
+                    context_docs = chat_history_response.get("context", [])
+                    query_answer = chat_history_response.get("answer", "")
+                    vllm_retrival_document = context_docs  # Ollama에서도 문서 정보 활용
+
+                    # 문서가 있으면 payload 업데이트
+                    if context_docs:
+                        self.request.chat.payload = self.document_processor.convert_document_to_payload(
+                            context_docs
+                        ) + self.request.chat.payload
+
                     # Update documents with history context if available
+                    """
                     context = chat_history_response.get("context", [])
                     if context:
                         self.request.chat.payload = self.document_processor.convert_document_to_payload(
                             context
                         ) + self.request.chat.payload
-
                     query_answer = chat_history_response.get("answer", "")
+                    """
 
                 elif settings.llm.llm_backend.lower() == "vllm":
                     # Process chat with history for vLLM
@@ -2244,8 +2256,9 @@ class ChatService:
             # Add source references
             if settings.prompt.source_count:
                 start_time = time.time()
-                # Run heavy tasks in thread pool
-                if retrieval_document is not None:
+                # 문서가 제공되었는지 확인하고 사용
+                if retrieval_document is not None and len(retrieval_document) > 0:
+                    logger.debug(f"[{session_id}] 제공된 문서 사용: {len(retrieval_document)}개")
                     query_answer = await asyncio.to_thread(
                         self.response_generator.make_answer_reference,
                         query_answer,
@@ -2254,7 +2267,9 @@ class ChatService:
                         retrieval_document,
                         self.request
                     )
-                else:
+                # 제공된 문서가 없으면 기본 문서 사용
+                elif hasattr(self, 'retriever_service') and hasattr(self.retriever_service, 'documents'):
+                    logger.debug(f"[{session_id}] retriever_service 문서 사용: {len(self.retriever_service.documents)}개")
                     query_answer = await asyncio.to_thread(
                         self.response_generator.make_answer_reference,
                         query_answer,
@@ -2263,6 +2278,9 @@ class ChatService:
                         self.retriever_service.documents,
                         self.request
                     )
+                else:
+                    logger.debug(f"[{session_id}] 출처 추가에 사용할 문서가 없습니다.")
+
                 await self._log(
                     "debug",
                     f"[{session_id}] References added: {time.time() - start_time:.4f}s elapsed",

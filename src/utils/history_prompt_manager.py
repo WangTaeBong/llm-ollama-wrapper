@@ -1,6 +1,7 @@
 import json
 import logging
 
+from langchain_core.prompts import PromptTemplate
 from src.common.config_loader import ConfigLoader
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,11 @@ class PromptManager:
             "System prompt for contextualizing questions could not be loaded."
         )
 
-        return prompt_text
+        # return prompt_text
+        return PromptTemplate(
+            template=prompt_text,
+            input_variables=["input", "chat_history"]
+        )
 
     @classmethod
     def get_rewrite_prompt_template(cls):

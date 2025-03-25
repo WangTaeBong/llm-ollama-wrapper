@@ -214,14 +214,6 @@ class GemmaHistoryHandler(VLLMHistoryHandler):
                     logger.warning(f"[{session_id}] 질문 재정의 실패, 원래 질문 사용")
                     rewritten_question = request.chat.user
                 else:
-                    # 질문 재정의 후 검증
-                    important_entities = extract_important_entities(request.chat.user)
-                    rewritten_question = validate_rewritten_question(
-                        request.chat.user,
-                        rewritten_question,
-                        important_entities,
-                        session_id
-                    )
                     logger.debug(f"[{session_id}] 최종 재정의 질문: '{rewritten_question}'")
 
             except asyncio.TimeoutError:
@@ -427,14 +419,6 @@ class GemmaHistoryHandler(VLLMHistoryHandler):
                     logger.warning(f"[{session_id}] 질문 재정의 실패, 원래 질문 사용")
                     rewritten_question = request.chat.user
                 else:
-                    # 질문 재정의 후 검증
-                    important_entities = extract_important_entities(request.chat.user)
-                    rewritten_question = validate_rewritten_question(
-                        request.chat.user,
-                        rewritten_question,
-                        important_entities,
-                        session_id
-                    )
                     logger.debug(f"[{session_id}] 최종 재정의 질문: '{rewritten_question}'")
             except asyncio.TimeoutError:
                 logger.warning(f"[{session_id}] 질문 재정의 타임아웃, 원래 질문 사용")
