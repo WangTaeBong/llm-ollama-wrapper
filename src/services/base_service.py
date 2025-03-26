@@ -10,6 +10,8 @@ import logging
 import time
 from typing import Dict, Any, Optional, List, Callable, Awaitable
 
+from src.services.utils.model_utils import ModelUtils
+
 # 로거 설정
 logger = logging.getLogger(__name__)
 
@@ -173,24 +175,7 @@ class BaseService(abc.ABC):
         Returns:
             bool: Gemma 모델이면 True, 아니면 False
         """
-        # LLM 백엔드 확인
-        backend = getattr(settings.llm, 'llm_backend', '').lower()
-
-        # OLLAMA 백엔드인 경우
-        if backend == 'ollama':
-            if hasattr(settings.ollama, 'model_name'):
-                model_name = settings.ollama.model_name.lower()
-                return 'gemma' in model_name
-
-        # VLLM 백엔드인 경우
-        elif backend == 'vllm':
-            if hasattr(settings.llm, 'model_type'):
-                model_type = settings.llm.model_type.lower() if hasattr(settings.llm.model_type, 'lower') else str(
-                    settings.llm.model_type).lower()
-                return model_type == 'gemma'
-
-        # 기본적으로 False 반환
-        return False
+        return ModelUtils.is_gemma_model(settings)
 
     @staticmethod
     def fire_and_forget(coro: Awaitable, background_tasks: Optional[List] = None):

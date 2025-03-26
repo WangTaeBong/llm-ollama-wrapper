@@ -64,6 +64,7 @@ from src.services.chat.retriever import RetrieverService
 from src.services.chat.processor.stream_processor import StreamResponsePostProcessor
 from src.services.base_service import BaseService
 from src.services.utils.cache_service import CacheService
+from src.services.utils.model_utils import ModelUtils
 
 # httpx 및 httpcore 로그 레벨 조정
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -83,87 +84,6 @@ _semaphore = Semaphore(settings.cache.max_concurrent_tasks)
 
 # Global LLM instance to be initialized during startup
 mai_chat_llm = None
-
-
-def _create_model_key(model: Any) -> str:
-    """
-    모델 객체로부터 캐시 키로 사용할 수 있는 문자열을 생성합니다.
-
-    Args:
-        model: LLM 모델 객체(OllamaLLM 등)
-
-    Returns:
-        str: 모델 식별 문자열
-    """
-    # 모델 타입을 기준으로 키 생성
-    model_type = type(model).__name__
-
-    # 만약 OllamaLLM이라면 모델 이름과 URL 추가
-    if model_type == "OllamaLLM":
-        model_name = getattr(model, "model", "unknown")
-        base_url = getattr(model, "base_url", "local")
-        temperature = getattr(model, "temperature", 0.7)
-        return f"{model_type}:{model_name}:{base_url}:{temperature}"
-
-    # 다른 모델 타입은 클래스 이름만 사용
-    return model_type
-
-
-def _create_prompt_key(prompt_template: Any) -> str:
-    """
-    프롬프트 템플릿으로부터 캐시 키로 사용할 수 있는 문자열을 생성합니다.
-
-    Args:
-        prompt_template: 프롬프트 템플릿 객체
-
-    Returns:
-        str: 프롬프트 식별 문자열
-    """
-    # 템플릿 문자열을 해시하여 키 생성
-    if hasattr(prompt_template, "template"):
-        template_str = str(prompt_template.template)
-    elif hasattr(prompt_template, "messages"):
-        template_str = str(prompt_template.messages)
-    else:
-        template_str = str(prompt_template)
-
-    # 해시 생성
-    return hashlib.md5(template_str.encode('utf-8')).hexdigest()
-
-
-def get_or_create_chain(settings_key: str, model: Any, prompt_template: Any) -> Any:
-    """
-    주어진 설정, 모델, 프롬프트 템플릿에 대한 체인을 가져오거나 생성합니다.
-    OllamaLLM과 같은 해시 불가능한 객체를 안전하게 처리합니다.
-
-    Args:
-        settings_key: 설정 키
-        model: LLM 모델 객체
-        prompt_template: 프롬프트 템플릿
-
-    Returns:
-        Any: 체인 인스턴스(캐시된 것 또는 새로 생성된 것)
-    """
-    # 모델과 프롬프트에 대한 안정적인 키 생성
-    model_key = _create_model_key(model)
-    prompt_key = _create_prompt_key(prompt_template)
-
-    # 결합된 캐시 키 생성
-    combined_key = f"{settings_key}:{model_key}:{prompt_key}"
-
-    def create_new_chain():
-        try:
-            new_chain = create_stuff_documents_chain(model, prompt_template)
-            # 체인이 필요한 'invoke' 메서드를 가지고 있는지 확인
-            if hasattr(new_chain, "invoke"):
-                return new_chain
-            return None
-        except Exception as e:
-            logger.error(f"체인 생성 중 오류 발생: {str(e)}", exc_info=True)
-            return None
-
-    # 캐시에서 가져오거나 생성
-    return CacheService.get_or_create("chain", combined_key, create_new_chain)
 
 
 async def limited_chain_invoke(chain, context, timeout=60):
@@ -258,7 +178,7 @@ async def model_llm_init(app: FastAPI):
         logger.info("캐시 서비스가 초기화 되었습니다.")
 
         # Validate configuration settings
-        validate_settings()
+        ModelUtils.validate_settings(settings)
 
         backend = settings.llm.llm_backend.lower()
         initialized_models = {}
@@ -306,26 +226,6 @@ async def model_llm_init(app: FastAPI):
         raise RuntimeError(f"LLM initialization failed: {err}")
     finally:
         logger.info("LLM context exited")
-
-
-def validate_settings():
-    """
-    Validate the Ollama or vLLM configuration settings.
-
-    Raises:
-        ValueError: If required configuration parameters are missing.
-    """
-    backend = settings.llm.llm_backend.lower()
-    if backend == 'ollama':
-        if not settings.ollama.model_name:
-            raise ValueError("Ollama model name not configured")
-        if settings.ollama.access_type.lower() == 'url' and not settings.ollama.ollama_url:
-            raise ValueError("Ollama URL not configured for URL access method")
-    elif backend == "vllm":
-        if not settings.vllm.endpoint_url:
-            raise ValueError("vLLM endpoint URL not configured")
-    else:
-        raise ValueError("LLM backend must be either 'ollama' or 'vllm'")
 
 
 _llm_circuit_breaker = CircuitBreaker.create_from_config(
@@ -456,7 +356,7 @@ class LLMService(BaseService):
             prompt_template = self.response_generator.get_rag_qa_prompt(self.request.meta.rag_sys_info)
             chat_prompt = ChatPromptTemplate.from_template(prompt_template)
 
-            chain = get_or_create_chain(self.settings_key, mai_chat_llm, chat_prompt)
+            chain = ModelUtils.get_or_create_chain(self.settings_key, mai_chat_llm, chat_prompt)
 
             logger.debug(
                 f"[{session_id}] Chain initialization complete: {time.time() - start_time:.4f}s"
@@ -638,7 +538,7 @@ class LLMService(BaseService):
                     continue
 
                 # 청크 처리 및 표준화
-                processed_chunk = self._process_vllm_chunk(chunk)
+                processed_chunk = ModelUtils.process_vllm_chunk(chunk)
 
                 # 청크 로깅 (텍스트가 있는 경우 길이만 기록)
                 log_chunk = processed_chunk.copy()
@@ -677,75 +577,6 @@ class LLMService(BaseService):
                 "message": f"스트리밍 오류: {str(e)}",
                 "finished": True
             }
-
-    @classmethod
-    def _process_vllm_chunk(cls, chunk):
-        """
-        vLLM 응답 청크를 표준 형식으로 처리합니다.
-
-        Args:
-            chunk: 원시 vLLM 응답 청크
-
-        Returns:
-            Dict: 처리된 청크
-        """
-        # 오류 확인
-        if 'error' in chunk:
-            return {
-                'error': True,
-                'message': chunk.get('message', '알 수 없는 오류'),
-                'finished': True
-            }
-
-        # 종료 마커 확인
-        if chunk == '[DONE]':
-            return {
-                'new_text': '',
-                'finished': True
-            }
-
-        # vLLM의 다양한 응답 형식 처리
-        if isinstance(chunk, dict):
-            # 텍스트 청크 (일반 스트리밍)
-            if 'new_text' in chunk:
-                return {
-                    'new_text': chunk['new_text'],
-                    'finished': chunk.get('finished', False)
-                }
-            # 완료 신호
-            elif 'finished' in chunk and chunk['finished']:
-                return {
-                    'new_text': '',
-                    'finished': True
-                }
-            # 전체 텍스트 응답 (비스트리밍 형식)
-            elif 'generated_text' in chunk:
-                return {
-                    'new_text': chunk['generated_text'],
-                    'finished': True
-                }
-            # OpenAI 호환 형식
-            elif 'delta' in chunk:
-                return {
-                    'new_text': chunk['delta'].get('content', ''),
-                    'finished': chunk.get('finished', False)
-                }
-            # 알 수 없는 형식
-            else:
-                return chunk
-
-        # 문자열 응답 (드문 경우)
-        elif isinstance(chunk, str):
-            return {
-                'new_text': chunk,
-                'finished': False
-            }
-
-        # 기타 타입 처리
-        return {
-            'new_text': str(chunk),
-            'finished': False
-        }
 
     async def stream_response(self, documents, language):
         """
