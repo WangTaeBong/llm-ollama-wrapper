@@ -65,6 +65,7 @@ from src.services.chat.processor.stream_processor import StreamResponsePostProce
 from src.services.base_service import BaseService
 from src.services.utils.cache_service import CacheService
 from src.services.utils.model_utils import ModelUtils
+from src.services.common.error_handler import ErrorHandler
 
 # httpx 및 httpcore 로그 레벨 조정
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -320,6 +321,7 @@ class LLMService(BaseService):
             request (ChatRequest): Chat request instance.
         """
         super().__init__(request.meta.session_id, settings)
+        self.error_handler = ErrorHandler()
 
         self.request = request
         self.settings_key = f"{request.meta.rag_sys_info}-{request.meta.session_id}"
@@ -796,25 +798,13 @@ class LLMService(BaseService):
             self.metrics["total_time"] += elapsed
 
             return result
-        except TimeoutError as e:
-            elapsed = time.time() - start_time
-            logger.error(
-                f"[{session_id}] LLM query timeout: {elapsed:.4f}s after {str(e)}"
-            )
-
-            self.metrics["error_count"] += 1
-
-            raise
         except Exception as e:
-            elapsed = time.time() - start_time
-            logger.error(
-                f"[{session_id}] LLM query failed: {elapsed:.4f}s after: {type(e).__name__}: {str(e)}",
-                exc_info=True
-            )
-
             self.metrics["error_count"] += 1
-
-            raise
+            return self.error_handler.handle_error(
+                error=e,
+                session_id=self.request.meta.session_id,
+                request=self.request
+            )
 
 
 class ChatService(BaseService):
@@ -844,6 +834,7 @@ class ChatService(BaseService):
             request (ChatRequest): The chat request containing user query and metadata.
         """
         super().__init__(request.meta.session_id, settings)
+        self.error_handler = ErrorHandler()
 
         self.request = request
         self.retriever_service = RetrieverService(request, settings)
@@ -1005,18 +996,12 @@ class ChatService(BaseService):
 
             return final_response
 
-        except ValueError as err:
-            await self.log("error", f"[{session_id}] Value error during chat processing: {err}", session_id=session_id,
-                           exc_info=True)
-            return self._create_response(ErrorCd.get_error(ErrorCd.CHAT_EXCEPTION), "Invalid input was provided.")
-        except KeyError as err:
-            await self.log("error", f"[{session_id}] Key error during chat processing: {err}", session_id=session_id,
-                           exc_info=True)
-            return self._create_response(ErrorCd.get_error(ErrorCd.CHAT_EXCEPTION), "A required key was missing.")
         except Exception as err:
-            await self.log("error", f"[{session_id}] Unexpected error during chat processing: {err}",
-                           session_id=session_id, exc_info=True)
-            return self._create_response(ErrorCd.get_error(ErrorCd.CHAT_EXCEPTION), "Unable to process the request.")
+            return self.error_handler.handle_error(
+                error=err,
+                session_id=self.request.meta.session_id,
+                request=self.request
+            )
 
     async def stream_chat(self, background_tasks: BackgroundTasks = None) -> StreamingResponse:
         """
@@ -1377,8 +1362,11 @@ class ChatService(BaseService):
             )
 
         except Exception as e:
-            await self.log("error", f"[{session_id}] 스트리밍 초기화 중 오류: {str(e)}",
-                           session_id=session_id, exc_info=True)
+            self.error_handler.handle_error(
+                error=e,
+                session_id=self.request.meta.session_id,
+                request=self.request
+            )
 
             # 오류 스트림 반환
             async def error_stream():
