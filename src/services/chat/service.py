@@ -12,7 +12,6 @@ import logging
 import random
 import re
 import time
-from typing import Dict, Any, Optional, Tuple, List
 
 from fastapi import BackgroundTasks
 from starlette.responses import StreamingResponse
@@ -33,10 +32,12 @@ from src.services.history.llm_history_handler import LlmHistoryHandler
 from src.services.llm.service import LLMService
 from src.services.messaging.formatters import MessageFormatter
 from src.services.query_processor import QueryProcessor
-from src.services.response_generator import ResponseGenerator
+from src.services.response_generator.core import ResponseGenerator
 from src.services.search_engine import SearchEngine
 from src.services.utils.cache_service import CacheService
+from src.services.utils.model_utils import ModelUtils
 from src.services.voc import VOCLinkProcessor
+from src.utils.redis_utils import RedisUtils
 
 # 설정 로드
 settings = ConfigLoader().get_settings()
@@ -53,14 +54,27 @@ class ChatService(BaseService):
     전체 채팅 처리 워크플로우를 조정합니다. 효율적이고 신뢰성 있는 채팅 처리를
     위한 종합적인 성능 모니터링, 캐싱 전략, 비동기 로깅을 구현합니다.
 
+    주요 기능:
+    - 문서 검색 및 최적화
+    - LLM 기반 응답 생성
+    - 스트리밍 처리
+    - 오류 복구 및 회로 차단기 패턴
+    - 응답 후처리 및 참조 처리
+    - 채팅 이력 관리
+
     클래스 속성:
         _circuit_breaker: 외부 서비스 보호를 위한 회로 차단기
     """
-    _circuit_breaker = CircuitBreaker(failure_threshold=3, reset_timeout=300)
+    # 회로 차단기 초기화: 연속 3번 실패 시 차단, 5분 후 자동 복구
+    _circuit_breaker = CircuitBreaker(
+        name="chat_service",
+        failure_threshold=3,
+        recovery_timeout=60,  # 1분 후 복구 시도
+        reset_timeout=300  # 5분 후 완전 복구
+    )
 
-    # 캐시 정리 주기
-    _cache_cleanup_interval = 3600  # 1시간마다 캐시 정리
-    _last_cache_cleanup = time.time()
+    # 백그라운드 태스크 추적
+    _background_tasks = []
 
     def __init__(self, request: ChatRequest):
         """
@@ -76,12 +90,17 @@ class ChatService(BaseService):
         self.retriever_service = RetrieverService(request, settings)
         self.llm_service = LLMService(request)
 
-        # 채팅 히스토리 사용 설정이 활성화된 경우 히스토리 핸들러 초기화
         # 전역 LLM 모델 참조
-        from src.services.llm_ollama_process import mai_chat_llm
+        try:
+            from src.services.llm_ollama_process import mai_chat_llm
+            self.mai_chat_llm = mai_chat_llm
+        except (ImportError, AttributeError):
+            self.mai_chat_llm = None
+            logger.warning(f"[{request.meta.session_id}] LLM 모델 참조를 가져올 수 없습니다.")
 
+        # 채팅 히스토리 핸들러 초기화
         self.history_handler = LlmHistoryHandler(
-            mai_chat_llm,
+            self.mai_chat_llm,
             self.request,
             max_history_turns=getattr(settings.chat_history, 'max_turns', 10)
         )
@@ -94,11 +113,9 @@ class ChatService(BaseService):
         self.voc_processor = VOCLinkProcessor(settings)
         self.search_engine = SearchEngine(settings)
 
-        # 세션 및 쿼리 기반 캐시 키 생성
-        self.cache_key = f"{self.request.meta.rag_sys_info}:{self.request.meta.session_id}:{self.request.chat.user}"
-
-        # 캐시 정리 확인
-        self._check_cache_cleanup()
+        # 세션, 시스템 정보 및 쿼리 기반 캐시 키 생성
+        user_query_hash = hashlib.md5(self.request.chat.user.encode('utf-8')).hexdigest()
+        self.cache_key = f"{self.request.meta.rag_sys_info}:{self.request.meta.session_id}:{user_query_hash}"
 
         # 포맷터 인스턴스 생성
         self.formatter = MessageFormatter()
@@ -114,8 +131,6 @@ class ChatService(BaseService):
         - LLM을 사용하여 응답 생성(채팅 히스토리 사용 설정인 경우 활용)
         - 참조 및 형식으로 응답 완성
 
-        이 메서드에는 포괄적인 오류 처리, 반복 쿼리의 캐싱, 상세한 성능 추적이 포함됩니다.
-
         Returns:
             ChatResponse: 결과, 메타데이터, 컨텍스트를 포함하는 응답 객체
         """
@@ -128,11 +143,18 @@ class ChatService(BaseService):
         self.start_time = time.time()
         self.processing_stages = {}
 
+        # 회로 차단기 확인
+        if self._circuit_breaker.is_open():
+            await self.log("warning", f"[{session_id}] 회로 차단기가 열려 있습니다. 요청 처리 불가.", session_id=session_id)
+            return self._create_response(
+                ErrorCd.get_error(ErrorCd.SERVICE_UNAVAILABLE),
+                "현재 서비스가 일시적으로 사용 불가능합니다. 잠시 후 다시 시도해 주세요."
+            )
+
         # 동일한 요청에 대한 응답 캐시 확인
         cached_response = CacheService.get("response", self.cache_key)
         if cached_response:
-            await self.log("info", f"[{session_id}] 캐시된 응답 반환", session_id=session_id,
-                           cache_key=self.cache_key)
+            await self.log("info", f"[{session_id}] 캐시된 응답 반환", session_id=session_id, cache_key=self.cache_key)
             return cached_response
 
         try:
@@ -140,8 +162,7 @@ class ChatService(BaseService):
             response = await self._handle_greeting_or_filter()
             if response:
                 elapsed = self.record_stage("greeting_filter")
-                await self.log("info", f"[{session_id}] 인사말/필터 단계 완료: {elapsed:.4f}초 소요",
-                               session_id=session_id)
+                await self.log("info", f"[{session_id}] 인사말/필터 단계 완료: {elapsed:.4f}초 소요", session_id=session_id)
                 return response
 
             # 필터링이 활성화된 경우 검색 문서 유효성 검사
@@ -149,8 +170,7 @@ class ChatService(BaseService):
                 filter_res = self.document_processor.validate_retrieval_documents(self.request)
                 if filter_res:
                     elapsed = self.record_stage("document_validation")
-                    await self.log("info", f"[{session_id}] 문서 유효성 검사 완료: {elapsed:.4f}초 소요",
-                                   session_id=session_id)
+                    await self.log("info", f"[{session_id}] 문서 유효성 검사 완료: {elapsed:.4f}초 소요", session_id=session_id)
                     return filter_res
 
             # 해당하는 경우 FAQ 쿼리 최적화
@@ -158,26 +178,28 @@ class ChatService(BaseService):
             if faq_query:
                 self.request.chat.user = faq_query
                 elapsed = self.record_stage("faq_optimization")
-                await self.log("info", f"[{session_id}] FAQ 쿼리 최적화: {elapsed:.4f}초 소요",
-                               session_id=session_id)
+                await self.log("info", f"[{session_id}] FAQ 쿼리 최적화: {elapsed:.4f}초 소요", session_id=session_id)
 
-            # 병렬 태스크 시작
-            # 문서 검색 및 언어 설정을 병렬로 처리
+            # 병렬 태스크 시작: 문서 검색 및 언어 설정을 병렬로 처리
             retrieval_task = asyncio.create_task(self._process_documents())
             language_task = asyncio.create_task(self._get_language_settings())
 
             # 태스크 완료 대기
-            await asyncio.gather(retrieval_task, language_task)
+            try:
+                await asyncio.gather(retrieval_task, language_task)
+            except Exception as e:
+                await self.log("error", f"[{session_id}] 병렬 처리 중 오류: {str(e)}", session_id=session_id, exc_info=True)
+                # 에러 처리 후 계속 진행합니다 - 개별 태스크 결과 체크
 
             # 결과 수집
-            documents = retrieval_task.result()
-            lang, trans_lang, reference_word = language_task.result()
+            documents = retrieval_task.result() if not retrieval_task.exception() else []
+            lang, trans_lang, reference_word = language_task.result() if not language_task.exception() else (
+            "ko", "ko", "출처")
 
             elapsed = self.record_stage("parallel_processing")
             await self.log(
                 "info",
-                f"[{session_id}] 병렬 처리 완료(준비): {elapsed:.4f}초 소요, "
-                f"{len(documents)}개 문서 검색됨",
+                f"[{session_id}] 병렬 처리 완료(준비): {elapsed:.4f}초 소요, {len(documents)}개 문서 검색됨",
                 session_id=session_id
             )
 
@@ -188,36 +210,59 @@ class ChatService(BaseService):
 
             # 채팅 히스토리 또는 직접 쿼리로 LLM 쿼리 처리
             start_llm_time = time.time()
-            query_answer, vllm_retrival_document = await self._process_llm_query(documents, lang, trans_lang)
+
+            # 회로 차단기로 LLM 호출 보호
+            try:
+                query_answer, vllm_retrival_document = await self.handle_request_with_retry(
+                    self._process_llm_query,
+                    max_retries=2,  # 최대 2회 재시도
+                    circuit_breaker=self._circuit_breaker,
+                    documents=documents,
+                    lang=lang,
+                    trans_lang=trans_lang
+                )
+            except Exception as e:
+                # LLM 처리 실패 시 대체 메시지 제공
+                await self.log("error", f"[{session_id}] LLM 처리 실패: {str(e)}", session_id=session_id, exc_info=True)
+                query_answer = "죄송합니다. 현재 응답을 생성할 수 없습니다. 잠시 후 다시 시도해 주세요."
+                vllm_retrival_document = documents
 
             llm_elapsed = time.time() - start_llm_time
             await self.log(
                 "info",
-                f"[{session_id}] LLM 처리 완료: {llm_elapsed:.4f}초 "
-                f"소요 [backend={settings.llm.llm_backend}]",
+                f"[{session_id}] LLM 처리 완료: {llm_elapsed:.4f}초 소요 [backend={settings.llm.llm_backend}]",
                 session_id=session_id
             )
             self.record_stage("llm_processing")
 
             # 역할 마커 제거로 생성된 응답 정리
-            cleaned_answer = re.sub(r'(AI:|Human:)', '', query_answer).strip()
+            cleaned_answer = re.sub(r'(AI:|Human:|Assistant:|User:)', '', query_answer).strip()
 
             # 활성화된 경우 채팅 히스토리 저장(대기하지 않고 비동기로 실행)
-            if settings.chat_history.enabled:
-                await asyncio.create_task(self._save_chat_history(cleaned_answer))
+            if settings.chat_history.enabled and cleaned_answer:
+                self.fire_and_forget(
+                    self._save_chat_history(cleaned_answer),
+                    self._background_tasks
+                )
 
             # 참조 및 형식으로 응답 완성
             start_finalize = time.time()
-            final_query_answer = await self._finalize_answer_async(cleaned_answer, reference_word,
-                                                               vllm_retrival_document)
+            final_query_answer = await self._finalize_answer_async(
+                cleaned_answer,
+                reference_word,
+                vllm_retrival_document or documents  # 우선 vllm 결과 사용, 없으면 원본 문서 사용
+            )
 
             finalize_elapsed = time.time() - start_finalize
-            await self.log("debug", f"[{session_id}] 응답 완성 완료: {finalize_elapsed:.4f}초 소요",
-                           session_id=session_id)
+            await self.log("debug", f"[{session_id}] 응답 완성 완료: {finalize_elapsed:.4f}초 소요", session_id=session_id)
             self.record_stage("answer_finalization")
 
             # 최종 응답 생성 및 반환
-            final_response = self._create_response(ErrorCd.get_error(ErrorCd.SUCCESS), final_query_answer)
+            final_response = self._create_response(
+                ErrorCd.get_error(ErrorCd.SUCCESS),
+                final_query_answer,
+                vllm_retrival_document or documents
+            )
 
             total_time = sum(self.processing_stages.values())
             await self.log(
@@ -227,13 +272,19 @@ class ChatService(BaseService):
                 stages=self.processing_stages
             )
 
-            # 상당한 시간이 소요되는 복잡한 쿼리에 대한 응답 캐싱
-            if total_time > 5.0:  # 5초 이상 소요되는 쿼리만 캐싱
+            # 상당한 시간이 소요되는 복잡한 쿼리에 대한 응답 캐싱 (5초 이상)
+            if total_time > 5.0:
                 CacheService.set("response", self.cache_key, final_response)
+
+            # 성공적인 응답 처리를 회로 차단기에 기록
+            self._circuit_breaker.record_success()
 
             return final_response
 
         except Exception as err:
+            # 예외 발생 시 회로 차단기에 실패 기록
+            self._circuit_breaker.record_failure(err)
+
             return self.error_handler.handle_error(
                 error=err,
                 session_id=self.request.meta.session_id,
@@ -242,8 +293,13 @@ class ChatService(BaseService):
 
     async def stream_chat(self, background_tasks: BackgroundTasks = None) -> StreamingResponse:
         """
-        문자 단위 처리를 통한 실시간 스트리밍 응답 제공, 히스토리 지원 기능 추가
-        개선된 2단계 접근법으로 대화 이력을 처리
+        문자 단위 처리를 통한 실시간 스트리밍 응답 제공
+
+        개선된 2단계 접근법으로 대화 이력을 처리하고,
+        문자 단위 스트리밍으로 사용자 경험을 향상시킵니다.
+
+        Args:
+            background_tasks: FastAPI 백그라운드 태스크 객체
 
         Returns:
             StreamingResponse: 스트리밍 응답 객체
@@ -254,6 +310,18 @@ class ChatService(BaseService):
         # 처리 시간 측정 시작
         self.start_time = time.time()
         self.processing_stages = {}
+
+        # 회로 차단기 확인
+        if self._circuit_breaker.is_open():
+            await self.log("warning", f"[{session_id}] 회로 차단기가 열려 있습니다. 스트리밍 요청 처리 불가.", session_id=session_id)
+
+            async def circuit_open_stream():
+                error_msg = "현재 서비스가 일시적으로 사용 불가능합니다. 잠시 후 다시 시도해 주세요."
+                error_data = {'error': True, 'text': error_msg, 'finished': True}
+                json_str = json.dumps(error_data, ensure_ascii=False)
+                yield f"data: {json_data}\n\n"
+
+            return StreamingResponse(circuit_open_stream(), media_type="text/event-stream")
 
         try:
             # 인사말 또는 간단한 응답 처리
@@ -268,25 +336,22 @@ class ChatService(BaseService):
                     error_data = {'text': greeting_response.chat.system, 'finished': False}
                     json_str = json.dumps(error_data, ensure_ascii=False)
                     yield f"data: {json_str}\n\n"
+
                     # 완료 신호 전송
                     error_data = {'text': '', 'finished': True}
                     json_str = json.dumps(error_data, ensure_ascii=False)
                     yield f"data: {json_str}\n\n"
+
                     # 전체 응답 전송
-                    error_data = {'complete_response': greeting_response.chat.system}
+                    error_data = {
+                        'complete_response': greeting_response.chat.system,
+                        'result_cd': greeting_response.result_cd,
+                        'result_desc': greeting_response.result_desc
+                    }
                     json_str = json.dumps(error_data, ensure_ascii=False)
                     yield f"data: {json_str}\n\n"
 
                 return StreamingResponse(simple_stream(), media_type="text/event-stream")
-
-            # 문서 검색 및 언어 설정 병렬 처리
-            language_task = asyncio.create_task(self._get_language_settings())
-            await language_task
-
-            # 결과 수집
-            lang, trans_lang, reference_word = language_task.result()
-            elapsed = self.record_stage("language_processing")
-            await self.log("info", f"[{session_id}] 언어 처리 완료: {elapsed:.4f}초 소요", session_id=session_id)
 
             # vLLM 백엔드 확인
             if settings.llm.llm_backend.lower() != "vllm":
@@ -300,6 +365,15 @@ class ChatService(BaseService):
                     yield f"data: {json_str}\n\n"
 
                 return StreamingResponse(error_stream(), media_type="text/event-stream")
+
+            # 문서 검색 및 언어 설정 병렬 처리
+            language_task = asyncio.create_task(self._get_language_settings())
+            await language_task
+
+            # 결과 수집
+            lang, trans_lang, reference_word = language_task.result()
+            elapsed = self.record_stage("language_processing")
+            await self.log("info", f"[{session_id}] 언어 처리 완료: {elapsed:.4f}초 소요", session_id=session_id)
 
             # 문자 단위 처리 프로세서 초기화 (빈 문서 리스트로 시작)
             empty_documents = []  # 명시적으로 빈 문서 리스트 생성
@@ -325,7 +399,7 @@ class ChatService(BaseService):
                 await self.history_handler.init_retriever(empty_documents)
 
                 # 모델 유형에 따른 스트리밍 핸들러 디스패치
-                if BaseService.is_gemma_model(settings):
+                if ModelUtils.is_gemma_model(settings):
                     logger.info(f"[{session_id}] Gemma 모델 감지됨, Gemma 스트리밍 핸들러로 처리")
                     vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_gemma_streaming(
                         self.request, trans_lang
@@ -334,7 +408,7 @@ class ChatService(BaseService):
                     # 기존 모델을 위한 처리
                     if settings.llm.steaming_enabled and settings.llm.llm_backend.lower() == "vllm":
                         # 개선된 히스토리 처리 기능 확인
-                        if getattr(settings.llm, 'use_improved_history', False):
+                        if use_improved_history:
                             # 개선된 2단계 접근법 사용
                             vllm_request, retrieval_document = await self.history_handler.handle_chat_with_history_vllm_streaming_improved(
                                 self.request, trans_lang
@@ -367,7 +441,6 @@ class ChatService(BaseService):
                     post_processor.documents = retrieval_document
             else:
                 # 히스토리 없는 일반 스트리밍 처리
-                # 컨텍스트 준비
                 await self.log("info", f"[{session_id}] 히스토리 없는 일반 스트리밍 처리 시작", session_id=session_id)
 
                 # 문서 검색
@@ -399,9 +472,11 @@ class ChatService(BaseService):
                         "check_block_line": settings.voc.check_block_line,
                     })
 
-                # 시스템 프롬프트 생성
-                # vllm_inquery_context = self.llm_service.build_system_prompt(context)
-                vllm_inquery_context = self.llm_service.build_system_prompt_gemma(context)
+                # Gemma 모델 자동 감지하여 프롬프트 빌드
+                if ModelUtils.is_gemma_model(settings):
+                    vllm_inquery_context = self.llm_service.build_system_prompt_gemma(context)
+                else:
+                    vllm_inquery_context = self.llm_service.build_system_prompt(context)
 
                 # 일반 vLLM 요청 준비
                 vllm_request = VllmInquery(
@@ -410,65 +485,123 @@ class ChatService(BaseService):
                     stream=True  # 스트리밍 모드 활성화
                 )
 
-            # 문자 단위 배치 설정
-            char_buffer = ""  # 문자 버퍼
-            max_buffer_time = 100  # 최대 100ms 지연 허용
-            min_chars_to_send = 2  # 최소 2자 이상일 때 전송 (한글 자모 조합 고려)
-            last_send_time = time.time()  # 마지막 전송 시간
-
             # 스트리밍 응답 생성
             async def generate_stream():
-                nonlocal char_buffer, last_send_time
+                # 문자 단위 배치 설정
+                char_buffer = ""  # 문자 버퍼
+                max_buffer_time = 100  # 최대 100ms 지연 허용
+                last_send_time = time.time()  # 마지막 전송 시간
+
                 start_llm_time = time.time()
                 error_occurred = False
                 full_response = None  # 전체 응답을 저장할 변수
 
                 try:
-                    # 스트리밍 처리
-                    async for chunk in rc.restapi_stream_async(session_id, vllm_url, vllm_request):
-                        current_time = time.time()
+                    # 스트리밍 처리 시작
+                    try:
+                        # 성공 기록
+                        self._circuit_breaker.record_success()
 
-                        # 빈 청크 스킵
-                        if chunk is None:
-                            continue
+                        # 스트리밍 요청 실행
+                        stream_iterator = rc.restapi_stream_async(session_id, vllm_url, vllm_request)
+                        async for chunk in stream_iterator:
+                            current_time = time.time()
 
-                        # 청크 유형에 따른 처리
-                        if isinstance(chunk, dict):
-                            # 텍스트 청크 처리
-                            if 'new_text' in chunk:
-                                text_chunk = chunk.get('new_text', '')
-                                is_finished = chunk.get('finished', False)
+                            # 빈 청크 스킵
+                            if chunk is None:
+                                continue
 
-                                # 문자 버퍼에 추가
-                                char_buffer += text_chunk
+                            # 청크 유형에 따른 처리
+                            if isinstance(chunk, dict):
+                                # 텍스트 청크 처리
+                                if 'new_text' in chunk:
+                                    text_chunk = chunk.get('new_text', '')
+                                    is_finished = chunk.get('finished', False)
 
-                                # 문자 단위 처리
-                                processed_text, char_buffer = post_processor.process_partial(char_buffer)
+                                    # 문자 버퍼에 추가
+                                    char_buffer += text_chunk
 
-                                # 처리된 텍스트가 있으면 즉시 전송
-                                if processed_text:
-                                    json_data = json.dumps(
-                                        {'text': processed_text, 'finished': False},
-                                        ensure_ascii=False
-                                    )
-                                    yield f"data: {json_data}\n\n"
-                                    last_send_time = current_time
+                                    # 문자 단위 처리
+                                    processed_text, char_buffer = post_processor.process_partial(char_buffer)
 
-                                # 시간 기반 강제 전송 확인
-                                elapsed_since_send = current_time - last_send_time
-                                if char_buffer and elapsed_since_send > (max_buffer_time / 1000):
-                                    # 최대 지연 시간 초과 시 현재 버퍼 강제 전송
-                                    json_data = json.dumps(
-                                        {'text': char_buffer, 'finished': False},
-                                        ensure_ascii=False
-                                    )
-                                    yield f"data: {json_data}\n\n"
-                                    char_buffer = ""
-                                    last_send_time = current_time
+                                    # 처리된 텍스트가 있으면 즉시 전송
+                                    if processed_text:
+                                        json_data = json.dumps(
+                                            {'text': processed_text, 'finished': False},
+                                            ensure_ascii=False
+                                        )
+                                        yield f"data: {json_data}\n\n"
+                                        last_send_time = current_time
 
-                                # 완료 신호 처리
-                                if is_finished:
-                                    # 남은 버퍼가 있으면 전송
+                                    # 시간 기반 강제 전송 확인
+                                    elapsed_since_send = current_time - last_send_time
+                                    if char_buffer and elapsed_since_send > (max_buffer_time / 1000):
+                                        # 최대 지연 시간 초과 시 현재 버퍼 강제 전송
+                                        json_data = json.dumps(
+                                            {'text': char_buffer, 'finished': False},
+                                            ensure_ascii=False
+                                        )
+                                        yield f"data: {json_data}\n\n"
+                                        char_buffer = ""
+                                        last_send_time = current_time
+
+                                    # 완료 신호 처리
+                                    if is_finished:
+                                        # 남은 버퍼가 있으면 전송
+                                        if char_buffer:
+                                            json_data = json.dumps(
+                                                {'text': char_buffer, 'finished': False},
+                                                ensure_ascii=False
+                                            )
+                                            yield f"data: {json_data}\n\n"
+                                            char_buffer = ""
+
+                                        # 전체 텍스트 최종 처리
+                                        full_response = await post_processor.finalize("")
+
+                                        # 문서 존재 여부 확인
+                                        documents_exist = False
+                                        if hasattr(post_processor, "documents") and post_processor.documents:
+                                            # 'wiki_ko'가 아닌 문서만 필터링하여 카운트
+                                            valid_documents = [
+                                                doc for doc in post_processor.documents
+                                                if not (hasattr(doc, 'metadata') and
+                                                        doc.metadata.get('source', doc.metadata.get('doc_name', '')).find(
+                                                            'wiki_ko') >= 0)
+                                            ]
+
+                                            await self.log("debug",
+                                                           f"[{session_id}] 문서 필터링: 전체 {len(post_processor.documents)}개 중 유효한 문서 {len(valid_documents)}개")
+                                            documents_exist = len(valid_documents) > 0
+
+                                        # 결과 코드 설정
+                                        result_code = ErrorCd.get_code(ErrorCd.SUCCESS)
+                                        if not documents_exist:
+                                            result_code = ErrorCd.get_code(ErrorCd.SUCCESS_NO_EXIST_KNOWLEDGE_DATA)
+
+                                        # 완료 신호 전송 (빈 텍스트, finished=true)
+                                        json_data = json.dumps(
+                                            {'text': "", 'finished': True},
+                                            ensure_ascii=False
+                                        )
+                                        yield f"data: {json_data}\n\n"
+
+                                        # 전체 완성된 응답 한 번 더 전송
+                                        complete_data = {
+                                            'complete_response': full_response,
+                                            'result_cd': result_code,
+                                            'result_desc': ErrorCd.get_description(
+                                                ErrorCd.SUCCESS_NO_EXIST_KNOWLEDGE_DATA if not documents_exist else ErrorCd.SUCCESS
+                                            )
+                                        }
+
+                                        json_data = json.dumps(complete_data, ensure_ascii=False)
+                                        yield f"data: {json_data}\n\n"
+                                        break
+
+                                # 완료 신호만 있는 경우
+                                elif chunk.get('finished', False):
+                                    # 남은 버퍼 처리
                                     if char_buffer:
                                         json_data = json.dumps(
                                             {'text': char_buffer, 'finished': False},
@@ -480,55 +613,31 @@ class ChatService(BaseService):
                                     # 전체 텍스트 최종 처리
                                     full_response = await post_processor.finalize("")
 
-                                    # 문서 존재 여부 확인
-                                    documents_exist = False
-                                    if hasattr(post_processor, "documents") and post_processor.documents:
-                                        # 'wiki_ko'가 아닌 문서만 필터링하여 카운트
-                                        valid_documents = [
-                                            doc for doc in post_processor.documents
-                                            if not (hasattr(doc, 'metadata') and
-                                                    doc.metadata.get('source', doc.metadata.get('doc_name', '')).find(
-                                                        'wiki_ko') >= 0)
-                                        ]
-
-                                        await self.log("debug",
-                                                       f"[{session_id}] 문서 필터링: 전체 {len(post_processor.documents)}개 중 유효한 문서 {len(valid_documents)}개")
-                                        documents_exist = len(valid_documents) > 0
-
-                                    # 결과 코드 설정
-                                    result_code = ErrorCd.get_code(ErrorCd.SUCCESS)
-                                    if not documents_exist:
-                                        result_code = ErrorCd.get_code(ErrorCd.SUCCESS_NO_EXIST_KNOWLEDGE_DATA)
-
-                                    # 완료 신호 전송 (빈 텍스트, finished=true)
+                                    # 완료 신호 전송
                                     json_data = json.dumps(
                                         {'text': "", 'finished': True},
                                         ensure_ascii=False
                                     )
                                     yield f"data: {json_data}\n\n"
 
-                                    # 전체 완성된 응답 한 번 더 전송
+                                    # 전체 완성된 응답 전송
                                     complete_data = {
                                         'complete_response': full_response,
-                                        'result_cd': result_code,
-                                        'result_desc': ErrorCd.get_description(
-                                            ErrorCd.SUCCESS_NO_EXIST_KNOWLEDGE_DATA if not documents_exist else ErrorCd.SUCCESS
-                                        )
+                                        'result_cd': ErrorCd.get_code(ErrorCd.SUCCESS),
+                                        'result_desc': ErrorCd.get_description(ErrorCd.SUCCESS)
                                     }
-
                                     json_data = json.dumps(complete_data, ensure_ascii=False)
                                     yield f"data: {json_data}\n\n"
                                     break
 
-                            # 완료 신호만 있는 경우
-                            elif chunk.get('finished', False):
-                                # 남은 버퍼 처리
+                            # 완료 마커 처리
+                            elif chunk == '[DONE]':
                                 if char_buffer:
                                     json_data = json.dumps(
                                         {'text': char_buffer, 'finished': False},
                                         ensure_ascii=False
                                     )
-                                    yield f"data: {json_data}\n\n"
+                                    yield f"data: {json_str}\n\n"
                                     char_buffer = ""
 
                                 # 전체 텍스트 최종 처리
@@ -542,47 +651,34 @@ class ChatService(BaseService):
                                 yield f"data: {json_data}\n\n"
 
                                 # 전체 완성된 응답 전송
-                                json_data = json.dumps(
-                                    {'complete_response': full_response},
-                                    ensure_ascii=False
-                                )
+                                complete_data = {
+                                    'complete_response': full_response,
+                                    'result_cd': ErrorCd.get_code(ErrorCd.SUCCESS),
+                                    'result_desc': ErrorCd.get_description(ErrorCd.SUCCESS)
+                                }
+                                json_data = json.dumps(complete_data, ensure_ascii=False)
                                 yield f"data: {json_data}\n\n"
                                 break
 
-                        # 완료 마커 처리
-                        elif chunk == '[DONE]':
-                            if char_buffer:
-                                json_data = json.dumps(
-                                    {'text': char_buffer, 'finished': False},
-                                    ensure_ascii=False
-                                )
-                                yield f"data: {json_data}\n\n"
-                                char_buffer = ""
+                    except Exception as stream_err:
+                        # 스트리밍 처리 중 오류 기록
+                        error_occurred = True
+                        self._circuit_breaker.record_failure(stream_err)
+                        await self.log("error", f"[{session_id}] 스트리밍 중 오류: {str(stream_err)}", exc_info=True)
 
-                            # 전체 텍스트 최종 처리
-                            full_response = await post_processor.finalize("")
-
-                            # 완료 신호 전송
-                            json_data = json.dumps(
-                                {'text': "", 'finished': True},
-                                ensure_ascii=False
-                            )
-                            yield f"data: {json_data}\n\n"
-
-                            # 전체 완성된 응답 전송
-                            json_data = json.dumps(
-                                {'complete_response': full_response},
-                                ensure_ascii=False
-                            )
-                            yield f"data: {json_data}\n\n"
-                            break
+                        # 오류 정보 전송
+                        error_json = json.dumps(
+                            {'error': True, 'text': "스트리밍 처리 중 오류가 발생했습니다.", 'finished': True},
+                            ensure_ascii=False
+                        )
+                        yield f"data: {error_json}\n\n"
+                        return
 
                     # LLM 처리 시간 기록
                     llm_elapsed = time.time() - start_llm_time
                     await self.log(
                         "info",
-                        f"[{session_id}] LLM 처리 완료: {llm_elapsed:.4f}초 소요 "
-                        f"[backend={settings.llm.llm_backend}]",
+                        f"[{session_id}] LLM 처리 완료: {llm_elapsed:.4f}초 소요 [backend={settings.llm.llm_backend}]",
                         session_id=session_id
                     )
                     self.record_stage("llm_processing")
@@ -594,10 +690,16 @@ class ChatService(BaseService):
                             background_tasks.add_task(self._save_chat_history, full_response)
                         else:
                             # 없으면 직접 태스크 생성
-                            self.fire_and_forget(self._save_chat_history(full_response))
+                            self.fire_and_forget(
+                                self._save_chat_history(full_response),
+                                self._background_tasks
+                            )
 
                 except Exception as err:
                     error_occurred = True
+                    # 회로 차단기에 실패 기록
+                    self._circuit_breaker.record_failure(err)
+
                     await self.log("error", f"[{session_id}] 스트리밍 처리 중 오류: {str(err)}", exc_info=True)
                     # 오류 정보 전송
                     error_json = json.dumps(
@@ -624,6 +726,10 @@ class ChatService(BaseService):
             )
 
         except Exception as e:
+            # 회로 차단기에 실패 기록
+            self._circuit_breaker.record_failure(e)
+
+            # 오류 메시지를 로깅하고 적절한 응답 반환
             self.error_handler.handle_error(
                 error=e,
                 session_id=self.request.meta.session_id,
