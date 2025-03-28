@@ -1243,6 +1243,24 @@ class ChatService(BaseService):
                                     # 전체 텍스트 최종 처리
                                     full_response = await post_processor.finalize("")
 
+                                    # 문서 존재 여부 확인
+                                    documents_exist = False
+                                    if hasattr(post_processor, "documents") and post_processor.documents:
+                                        # 'wiki_ko'가 아닌 문서만 필터링하여 카운트
+                                        valid_documents = [
+                                            doc for doc in post_processor.documents
+                                            if not (hasattr(doc, 'metadata') and
+                                                    doc.metadata.get('source', doc.metadata.get('doc_name', '')).find('wiki_ko') >= 0)
+                                        ]
+
+                                        await self.log("debug", f"[{session_id}] 문서 필터링: 전체 {len(post_processor.documents)}개 중 유효한 문서 {len(valid_documents)}개")
+                                        documents_exist = len(valid_documents) > 0
+
+                                    # 결과 코드 설정
+                                    result_code = ErrorCd.get_code(ErrorCd.SUCCESS)
+                                    if not documents_exist:
+                                        result_code = ErrorCd.get_code(ErrorCd.SUCCESS_NO_EXIST_KNOWLEDGE_DATA)
+
                                     # 완료 신호 전송 (빈 텍스트, finished=true)
                                     json_data = json.dumps(
                                         {'text': "", 'finished': True},
@@ -1251,10 +1269,15 @@ class ChatService(BaseService):
                                     yield f"data: {json_data}\n\n"
 
                                     # 전체 완성된 응답 한 번 더 전송
-                                    json_data = json.dumps(
-                                        {'complete_response': full_response},
-                                        ensure_ascii=False
-                                    )
+                                    complete_data = {
+                                        'complete_response': full_response,
+                                        'result_cd': result_code,
+                                        'result_desc': ErrorCd.get_description(
+                                            ErrorCd.SUCCESS_NO_EXIST_KNOWLEDGE_DATA if not documents_exist else ErrorCd.SUCCESS
+                                        )
+                                    }
+
+                                    json_data = json.dumps(complete_data, ensure_ascii=False)
                                     yield f"data: {json_data}\n\n"
                                     break
 
@@ -1782,33 +1805,49 @@ class ChatService(BaseService):
             # Return original answer if finalization fails
             return query_answer
 
-    def _create_response(self, error_code, system_msg):
+    def _create_response(self, error_code, system_msg, retrieval_documents=None):
         """
-        Create a ChatResponse object with appropriate metadata.
+        채팅 응답 객체를 생성합니다.
 
-        This method constructs the response object with error code,
-        system message, metadata, and payload information. It also
-        adds performance data if supported.
+        vllm_retrival_document 기준으로 지식 데이터 존재 여부를 판단하여
+        적절한 에러 코드를 설정합니다.
 
         Args:
-            error_code (dict): Error code information
-            system_msg (str): System response message
+            error_code (dict): 에러 코드 정보
+            system_msg (str): 시스템 응답 메시지
+            retrieval_documents (list, optional): 검색된 문서 목록
 
         Returns:
-            ChatResponse: Complete response object
+            ChatResponse: 완성된 응답 객체
         """
         session_id = self.request.meta.session_id
 
         try:
-            # Prepare payload - optimize for large data
-            request_payload = self.request.chat.payload or []
+            # 검색된 문서 존재 여부 확인
+            has_documents = False
 
-            payloads = [
-                PayloadRes(doc_name=doc.doc_name, doc_page=doc.doc_page, content=doc.content)
-                for doc in request_payload
-            ]
+            # retrieval_documents 매개변수가 제공된 경우 우선 사용
+            if retrieval_documents is not None:
+                has_documents = len(retrieval_documents) > 0
 
-            # Create and return response object
+            # 문서가 없는 경우 에러 코드 수정
+            if not has_documents and error_code.get("code") == ErrorCd.get_code(ErrorCd.SUCCESS):
+                # 문서가 없지만 성공 코드가 전달된 경우, 적절한 코드로 변경
+                error_code = ErrorCd.get_error(ErrorCd.SUCCESS_NO_EXIST_KNOWLEDGE_DATA)
+                logger.debug(f"[{session_id}] 문서가 없어 에러 코드를 SUCCESS_NO_EXIST_KNOWLEDGE_DATA로 변경")
+
+            # 페이로드 준비
+            payloads = []
+
+            # retrieval_documents 가 있는 경우 이를 페이로드로 변환
+            if has_documents:
+                payload_objects = self.document_processor.convert_document_to_payload(retrieval_documents)
+                payloads = [
+                    PayloadRes(doc_name=doc.doc_name, doc_page=doc.doc_page, content=doc.content)
+                    for doc in payload_objects
+                ]
+
+            # 응답 객체 생성 및 반환
             response = ChatResponse(
                 result_cd=error_code.get("code"),
                 result_desc=error_code.get("desc"),
@@ -1824,11 +1863,11 @@ class ChatService(BaseService):
                     category1=self.request.chat.category1,
                     category2=self.request.chat.category2,
                     category3=self.request.chat.category3,
-                    info=payloads,
+                    info=[],  # 일단은 페이로드를 빈 값으로 전달
                 )
             )
 
-            # Add performance data if supported
+            # 성능 데이터 추가 (지원되는 경우)
             if hasattr(response, 'add_performance_data'):
                 total_time = sum(self.processing_stages.values()) if self.processing_stages else 0
                 retriever_metrics = self.retriever_service.get_performance_metrics()
@@ -1841,13 +1880,13 @@ class ChatService(BaseService):
                 })
 
                 logger.debug(
-                    f"[{session_id}] Performance data added to response: {total_time:.4f}s total processing time")
+                    f"[{session_id}] 응답에 성능 데이터 추가: {total_time:.4f}초 총 처리 시간")
 
             return response
 
         except Exception as e:
-            logger.error(f"[{session_id}] Error creating response object: {str(e)}", exc_info=True)
-            # Create fallback response on error
+            logger.error(f"[{session_id}] 응답 객체 생성 중 오류: {str(e)}", exc_info=True)
+            # 오류 발생 시 대체 응답 생성
             return ChatResponse(
                 result_cd=ErrorCd.get_error(ErrorCd.CHAT_EXCEPTION).get("code"),
                 result_desc=ErrorCd.get_error(ErrorCd.CHAT_EXCEPTION).get("desc"),
@@ -1859,7 +1898,7 @@ class ChatService(BaseService):
                 ),
                 chat=ChatRes(
                     user=self.request.chat.user if hasattr(self.request.chat, 'user') else "",
-                    system="An error occurred while generating the response.",
+                    system="응답 생성 중 오류가 발생했습니다.",
                     category1="",
                     category2="",
                     category3="",
